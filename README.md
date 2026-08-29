@@ -178,7 +178,11 @@ agent. Reply with `xmsg send <their-session-id> "..."` if a reply is warranted.
 **光 DELETE 不够，文件不会自己缩**：SQLite 的 DELETE 只把页还进 freelist，
 文件停在历史最高水位。所以 freelist 超过 256 页（约 1MB）时跑一次 `VACUUM`。
 实测灌 300 条 3KB 消息把库撑到 1.24MB，清理后回到 36KB（**收缩 98%**，freelist 归零）。
-没到阈值就跳过，常路径只是两条 pragma，不做重写。
+
+**没到阈值不 VACUUM 也不是泄漏**：那些空页会被后续消息复用。实测清理后停在 528KB /
+120 空页，再灌同样一批 120 条 3KB 消息，文件**一个字节都没长**。所以阈值以下跳过
+只是「不急着把空间还给文件系统」，不是空间失控 —— 稳态下库的大小由峰值流量决定，
+而不是随时间无限增长。常路径就是两条 pragma，不做重写。
 
 ## fail-open：坏了顶多不投，绝不能卡住会话
 
