@@ -6,9 +6,12 @@
 
 ```
 A 会话:  xmsg send <B的session> "..."      → 写一行到 SQLite，就结束了
-B 会话:  ...正在跑第 3 个工具调用...
-         PreToolUse hook 触发 → 取出消息 → 作为 additionalContext 返回
-         → B 在这一轮的下一个工具调用之前就看到了内容
+
+B 还会再调工具:  PreToolUse hook 触发 → 取出消息 → additionalContext
+                 → B 在这一轮的下一个工具调用之前就看到了内容
+
+B 这一轮要收尾:  Stop hook 触发 → 取出消息 → decision:block + reason
+                 → 这一轮带着消息重启，B 在转 idle 之前看到了内容
 ```
 
 不是轮询：投递方写完即返回，接收方不问「有没有新消息」。推力来自 host 自己在
@@ -81,7 +84,7 @@ clone 到 `~/agent-msg` 以外的路径也行，此时给两个 host 的 hook �
 | `~/agent-msg/xmsg.py` | 全部逻辑（发送端 CLI + 接收端 hook），单文件无依赖 |
 | `~/agent-msg/xmsg-hook.sh` | hook 入口，负责 fail-open 与超时兜底 |
 | `~/agent-msg/bin/xmsg` | 薄 dispatcher，软链进 PATH 后就是命令名 `xmsg` |
-| `~/agent-msg/tests/test_xmsg.py` | 43 个测试 |
+| `~/agent-msg/tests/test_xmsg.py` | 51 个测试 |
 | `~/.local/share/agent-msg/messages.sqlite3` | 消息队列（本机运行态，不进版本库） |
 
 消息库**故意不用** `~/.agent-memory/index.sqlite3`：那个库每分钟被 systemd timer
@@ -149,10 +152,33 @@ agent. Reply with `xmsg send <their-session-id> "..."` if a reply is warranted.
 其它几条边界，都是 `PreToolUse` 高频触发逼出来的：
 
 - 单次注入上限 10 条 / 单条 8000 字符，超出的留到下一个工具调用，不丢也不一次灌完。
-- 已投递的行保留 14 天供 `xmsg outbox` 回查，之后清掉。清理只在 `send` 时顺手做，
-  **不在 hook 里做**——hook 的预算要留给投递本身。
 - 会话安静 30 分钟后不再作为投递目标出现。活跃会话靠工具调用不断刷新这个时间戳，
   唯一的变安静方式就是真的停了。
+
+## 库不会无限膨胀
+
+消息读完**不是立刻删**，而是进入一个保留窗口 —— `xmsg outbox` 得能回答
+「我发的那条投到了没」。窗口过了就 `DELETE`，不是永久存着。
+
+| 数据 | 保留多久 | 之后 |
+| --- | --- | --- |
+| 已投递 / 已过期的消息 | 14 天（`XMSG_RETAIN_SECONDS`） | 删行 |
+| peers 注册记录 | 30 天（`XMSG_RETAIN_PEER_SECONDS`） | 删行 |
+| 排队中未投递的消息 | TTL 1 小时（`XMSG_TTL_SECONDS`） | 标 expired，再按上面第一行删 |
+
+清理跑在三个地方：`send`（每次）、`doctor`（每次，且会报清了多少）、
+**hook 路径（节流到约每小时一次）**。
+
+**为什么 hook 也要跑**：清理原先只在 `send` 时做。一台**只收不发**的机器就永远不清 ——
+实测造 50 条 100 天前投递的行，跑 20 次 hook 加一次 `doctor` 都清不掉。所以 hook 路径
+也得清，但它每轮触发几十次、预算要留给投递，于是用 `meta.last_sweep_at` 节流：
+先抢着写时间戳再干活，抢不到就跳过。实测 40 次 hook 只清一次，单次 hook 约 37ms
+（含 python 启动），远在 3s 兜底预算内。清理失败被单独 catch 掉，不影响已领取的消息。
+
+**光 DELETE 不够，文件不会自己缩**：SQLite 的 DELETE 只把页还进 freelist，
+文件停在历史最高水位。所以 freelist 超过 256 页（约 1MB）时跑一次 `VACUUM`。
+实测灌 300 条 3KB 消息把库撑到 1.24MB，清理后回到 36KB（**收缩 98%**，freelist 归零）。
+没到阈值就跳过，常路径只是两条 pragma，不做重写。
 
 ## fail-open：坏了顶多不投，绝不能卡住会话
 
@@ -199,12 +225,13 @@ hook 报 Errno 2。第二、三行兜底是冗余的，属于纵深防御而非�
 ## 跑测试
 
 ```bash
-python3 -m pytest ~/agent-msg/tests/test_xmsg.py -q     # 43 passed, 3 subtests passed
+python3 -m pytest ~/agent-msg/tests/test_xmsg.py -q     # 51 passed, 3 subtests passed
 ```
 
 覆盖投递、幂等（含 8 线程并发只准一条命中）、定址（前缀/歧义/广播/过期 peer）、
 `Stop` 窗口 7 例（block 输出形式、防循环守卫、守卫不吃消息、两窗口共享
-at-most-once）、TTL 清理、fail-open 8 例、CLI 端到端 7 例。
+at-most-once）、清理 9 例（保留窗口内外、只收不发的机器也清、hook 节流、
+不误删排队中的消息、VACUUM 真收缩 / 无谓时跳过）、fail-open 8 例、CLI 端到端 7 例。
 
 测试里 `run_hook` 会强制设 `XMSG_IMPL` 指向被测副本。**这行不能删**：
 `xmsg-hook.sh` 的 `$impl` 默认回落到 `$HOME/agent-msg/xmsg.py`，不固定的话
@@ -222,7 +249,10 @@ at-most-once）、TTL 清理、fail-open 8 例、CLI 端到端 7 例。
 | `XMSG_MAX_PER_INJECT` | 10 | 单次注入条数上限 |
 | `XMSG_MAX_BODY_CHARS` | 8000 | 单条正文上限 |
 | `XMSG_HOOK_TIMEOUT` | 3 | hook 自我切断时限（秒） |
-| `XMSG_RETAIN_SECONDS` | 1209600 | 已投递行保留多久 |
+| `XMSG_RETAIN_SECONDS` | 1209600 | 已投递行保留多久（14 天），之后删行 |
+| `XMSG_RETAIN_PEER_SECONDS` | 2592000 | peers 记录保留多久（30 天） |
+| `XMSG_HOOK_SWEEP_INTERVAL` | 3600 | hook 路径最短清理间隔（秒） |
+| `XMSG_VACUUM_FREE_PAGES` | 256 | freelist 超过多少页才 VACUUM 收缩文件 |
 | `XMSG_FROM` / `_TOOL` / `_SESSION` | — | 发送方自报身份 |
 | `XMSG_NO_FAILOPEN` | — | `=1` 关掉全部兜底，仅用于反证 |
 

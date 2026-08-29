@@ -65,9 +65,23 @@ DEFAULT_TTL_SECONDS = int(os.environ.get("XMSG_TTL_SECONDS", "3600"))
 MAX_MESSAGES_PER_INJECT = int(os.environ.get("XMSG_MAX_PER_INJECT", "10"))
 MAX_BODY_CHARS = int(os.environ.get("XMSG_MAX_BODY_CHARS", "8000"))
 
-# Delivered rows are kept for a while so `xmsg status` can answer "did it land",
-# then swept. Sweeping happens opportunistically on send, never in the hook.
+# Delivered rows are kept for a while so `xmsg outbox` can answer "did it land",
+# then deleted. Sweeping runs on send, and - throttled - on the hook path too,
+# because a machine that only ever receives would otherwise never sweep at all.
 RETAIN_DELIVERED_SECONDS = int(os.environ.get("XMSG_RETAIN_SECONDS", str(14 * 86400)))
+
+# A peer that has not been seen this long is dropped from the registry.
+RETAIN_PEER_SECONDS = int(os.environ.get("XMSG_RETAIN_PEER_SECONDS", str(30 * 86400)))
+
+# How rarely the hook path is allowed to sweep. The hook fires dozens of times
+# per turn and its budget belongs to delivery, so sweeping there has to be the
+# exception: one session records the attempt, everyone else skips cheaply.
+HOOK_SWEEP_INTERVAL_SECONDS = int(os.environ.get("XMSG_HOOK_SWEEP_INTERVAL", "3600"))
+
+# Reclaim disk once the freelist is worth reclaiming. DELETE alone leaves the
+# pages in the file, so a burst that inflates the database keeps that size for
+# good without this.
+VACUUM_FREE_PAGE_THRESHOLD = int(os.environ.get("XMSG_VACUUM_FREE_PAGES", "256"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -103,6 +117,13 @@ CREATE TABLE IF NOT EXISTS peers (
 );
 
 CREATE INDEX IF NOT EXISTS peers_last_seen_idx ON peers(last_seen_at);
+
+-- One row per housekeeping key. Exists so the hook path can rate-limit its own
+-- sweeping without a lock file or a timestamp on disk.
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
 """
 
 
@@ -189,19 +210,83 @@ def resolve_target(conn: sqlite3.Connection, spec: str, *, allow_unknown: bool) 
 # --------------------------------------------------------------------------
 # sender side
 # --------------------------------------------------------------------------
-def sweep(conn: sqlite3.Connection) -> None:
-    """Expire stale queued rows and drop long-delivered ones. Sender-side only."""
+def sweep(conn: sqlite3.Connection, *, vacuum: bool = True) -> int:
+    """Expire stale queued rows, delete long-finished ones, reclaim the space.
+
+    A message is not kept forever: once delivered (or expired) and older than
+    RETAIN_DELIVERED_SECONDS it is deleted outright. The retention window exists
+    only so `xmsg outbox` can still answer "did it land" for a while.
+
+    Returns the number of rows deleted.
+    """
     t = now()
     conn.execute(
         "UPDATE messages SET expired_at = ? WHERE delivered_at IS NULL AND expired_at IS NULL AND expires_at < ?",
         (t, t),
     )
-    conn.execute(
+    cur = conn.execute(
         "DELETE FROM messages WHERE (delivered_at IS NOT NULL OR expired_at IS NOT NULL) "
         "AND COALESCE(delivered_at, expired_at) < ?",
         (t - RETAIN_DELIVERED_SECONDS,),
     )
-    conn.execute("DELETE FROM peers WHERE last_seen_at < ?", (t - 30 * 86400,))
+    deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    conn.execute("DELETE FROM peers WHERE last_seen_at < ?", (t - RETAIN_PEER_SECONDS,))
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('last_sweep_at', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (t,),
+    )
+    if vacuum:
+        reclaim(conn)
+    return deleted
+
+
+def reclaim(conn: sqlite3.Connection) -> bool:
+    """VACUUM once the freelist is big enough to be worth the rewrite.
+
+    DELETE returns pages to SQLite's freelist but never shrinks the file, so a
+    burst of traffic would leave the database permanently inflated at its high
+    water mark. Checking freelist_count first keeps this off the common path:
+    with nothing to reclaim it is two cheap pragmas and no rewrite. VACUUM needs
+    the whole database, so it cannot run inside a transaction.
+    """
+    free = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    if free < VACUUM_FREE_PAGE_THRESHOLD:
+        return False
+    conn.execute("VACUUM")
+    return True
+
+
+def sweep_if_due(conn: sqlite3.Connection) -> bool:
+    """The hook path's sweep: at most once per HOOK_SWEEP_INTERVAL_SECONDS.
+
+    Without this, a machine that only ever *receives* would never sweep, since
+    sweeping used to happen on send only - delivered rows would sit there for
+    good. The claim is written before the work so that concurrent hooks (there
+    are many) do not all sweep at once; losing the race means skipping, which
+    is the right outcome for a path whose budget belongs to delivery.
+    """
+    t = now()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'last_sweep_at'").fetchone()
+        last = int(row["value"]) if row is not None else 0
+        due = (t - last) >= HOOK_SWEEP_INTERVAL_SECONDS
+        if due:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('last_sweep_at', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (t,),
+            )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    if not due:
+        return False
+    # Outside the transaction: VACUUM cannot run inside one.
+    sweep(conn)
+    return True
 
 
 def default_sender_label() -> tuple[str, str, str]:
@@ -452,6 +537,14 @@ def hook_body(tool: str, raw: str) -> str:
     try:
         rows = claim(conn, session_id, tool, event)
         _register_peer(conn, payload, tool, len(rows))
+        # Housekeeping, throttled to roughly hourly and never at the expense of
+        # the delivery above: a machine that only receives would otherwise never
+        # sweep, and its delivered rows would accumulate without bound. Failing
+        # here must not cost the messages already claimed.
+        try:
+            sweep_if_due(conn)
+        except BaseException:
+            pass
     finally:
         conn.close()
 
@@ -503,9 +596,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"db          {DB_PATH}  ({'exists' if DB_PATH.exists() else 'MISSING - created on first use'})")
     print(f"ttl         {DEFAULT_TTL_SECONDS}s")
     print(f"peer stale  {PEER_STALE_SECONDS}s")
+    print(f"retain      {RETAIN_DELIVERED_SECONDS}s delivered / {RETAIN_PEER_SECONDS}s peers")
     print(f"python3     {shutil.which('python3')}")
     conn = connect()
     try:
+        size_before = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+        # doctor is a good moment to do the housekeeping unconditionally: it is
+        # explicitly invoked, never on a hot path, and it reports what it did.
+        deleted = sweep(conn)
         peers = conn.execute("SELECT COUNT(*) c FROM peers").fetchone()["c"]
         live = conn.execute(
             "SELECT COUNT(*) c FROM peers WHERE last_seen_at >= ?", (now() - PEER_STALE_SECONDS,)
@@ -513,8 +611,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         queued = conn.execute(
             "SELECT COUNT(*) c FROM messages WHERE delivered_at IS NULL AND expired_at IS NULL"
         ).fetchone()["c"]
+        kept = conn.execute(
+            "SELECT COUNT(*) c FROM messages WHERE delivered_at IS NOT NULL OR expired_at IS NOT NULL"
+        ).fetchone()["c"]
+        free = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        row = conn.execute("SELECT value FROM meta WHERE key = 'last_sweep_at'").fetchone()
         print(f"peers       {live} live / {peers} known")
         print(f"queued      {queued}")
+        print(f"retained    {kept} finished row(s) awaiting deletion")
+        size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+        note = f"  (was {size_before}, reclaimed)" if size < size_before else ""
+        print(f"db size     {size} bytes, {free} free page(s){note}")
+        if deleted:
+            print(f"swept       deleted {deleted} row(s) past retention")
+        if row is not None:
+            print(f"last sweep  {ago(int(row['value']))} ago")
     finally:
         conn.close()
     return 0

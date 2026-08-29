@@ -74,6 +74,24 @@ class Base(unittest.TestCase):
         finally:
             conn.close()
 
+    def queue_many(self, count: int, body: str, *, sessions: int = 1) -> None:
+        """Bulk insert on one connection. queue() reconnects (and re-runs the
+        schema script) per call, which dominates once you want hundreds of rows.
+        """
+        conn = self.x.connect()
+        try:
+            t = self.x.now()
+            conn.executemany(
+                "INSERT INTO messages (created_at, expires_at, from_label, from_tool, from_session, "
+                "to_session, body) VALUES (?,?,?,?,?,?,?)",
+                [
+                    (t, t + 3600, "peer-a", "claude", "sess-a", f"sess-{i % sessions}", body)
+                    for i in range(count)
+                ],
+            )
+        finally:
+            conn.close()
+
     def hook(self, payload: dict | None = None, tool: str = "codex") -> str:
         return self.x.hook_body(tool, json.dumps(payload if payload is not None else PAYLOAD))
 
@@ -337,6 +355,134 @@ class TestSweep(Base):
         finally:
             conn.close()
         self.assertIsNone(row["expired_at"])
+
+    def age_finished_rows(self, seconds: int) -> None:
+        """Backdate every finished row so it falls outside the retention window."""
+        conn = self.x.connect()
+        try:
+            conn.execute(
+                "UPDATE messages SET delivered_at = ? WHERE delivered_at IS NOT NULL",
+                (self.x.now() - seconds,),
+            )
+            conn.execute(
+                "UPDATE messages SET expired_at = ? WHERE expired_at IS NOT NULL",
+                (self.x.now() - seconds,),
+            )
+        finally:
+            conn.close()
+
+    def count_messages(self) -> int:
+        conn = self.x.connect()
+        try:
+            return int(conn.execute("SELECT COUNT(*) c FROM messages").fetchone()["c"])
+        finally:
+            conn.close()
+
+    def test_delivered_row_is_deleted_once_past_retention(self) -> None:
+        """A read message does not stay forever - retention is a window, not storage."""
+        self.queue("done with this one")
+        self.hook()
+        self.age_finished_rows(self.x.RETAIN_DELIVERED_SECONDS + 86400)
+        conn = self.x.connect()
+        try:
+            self.assertEqual(self.x.sweep(conn), 1)
+        finally:
+            conn.close()
+        self.assertEqual(self.count_messages(), 0)
+
+    def test_delivered_row_survives_inside_retention(self) -> None:
+        """`xmsg outbox` has to be able to answer "did it land" for a while."""
+        self.queue("recent")
+        self.hook()
+        conn = self.x.connect()
+        try:
+            self.x.sweep(conn)
+        finally:
+            conn.close()
+        self.assertEqual(self.count_messages(), 1)
+
+    def test_receive_only_machine_still_sweeps(self) -> None:
+        """The gap this closes: sweeping used to happen on send only, so a
+        machine that only ever received never swept and grew without bound."""
+        for i in range(5):
+            self.queue(f"msg-{i}")
+        self.hook()
+        self.age_finished_rows(self.x.RETAIN_DELIVERED_SECONDS + 86400)
+        self.assertEqual(self.count_messages(), 5)
+        # Nothing is sent from here on - only the hook path runs.
+        conn = self.x.connect()
+        try:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('last_sweep_at', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (self.x.now() - self.x.HOOK_SWEEP_INTERVAL_SECONDS - 1,),
+            )
+        finally:
+            conn.close()
+        self.hook()
+        self.assertEqual(self.count_messages(), 0, "receive-only path never swept")
+
+    def test_hook_sweep_is_throttled(self) -> None:
+        """PreToolUse fires dozens of times per turn; sweeping every time would
+        spend the hook's budget on housekeeping instead of delivery."""
+        conn = self.x.connect()
+        try:
+            self.assertTrue(self.x.sweep_if_due(conn), "first call should sweep")
+            self.assertFalse(self.x.sweep_if_due(conn), "second call should be throttled")
+        finally:
+            conn.close()
+
+    def test_hook_sweep_runs_again_once_the_interval_passes(self) -> None:
+        conn = self.x.connect()
+        try:
+            self.assertTrue(self.x.sweep_if_due(conn))
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'last_sweep_at'",
+                (self.x.now() - self.x.HOOK_SWEEP_INTERVAL_SECONDS - 1,),
+            )
+            self.assertTrue(self.x.sweep_if_due(conn), "should sweep again after the interval")
+        finally:
+            conn.close()
+
+    def test_sweeping_does_not_disturb_a_queued_message(self) -> None:
+        """Housekeeping must never eat mail that has not been delivered yet."""
+        self.queue("NONCE-UNIT-SWEEP-KEEP")
+        conn = self.x.connect()
+        try:
+            self.x.sweep(conn)
+            self.x.sweep_if_due(conn)
+        finally:
+            conn.close()
+        self.assertIn("NONCE-UNIT-SWEEP-KEEP", self.hook())
+
+    def test_deleting_rows_reclaims_disk_rather_than_leaving_a_hole(self) -> None:
+        """DELETE returns pages to the freelist but never shrinks the file, so
+        without VACUUM a traffic burst would inflate the database permanently."""
+        self.queue_many(400, "x" * 4000, sessions=4)
+        # claim() caps each call at MAX_MESSAGES_PER_INJECT, so drain rather than
+        # assuming one hook call per session empties the queue.
+        for i in range(4):
+            payload = json.dumps(dict(PAYLOAD, session_id=f"sess-{i}"))
+            while self.x.hook_body("claude", payload):
+                pass
+        peak = self.db.stat().st_size
+        self.age_finished_rows(self.x.RETAIN_DELIVERED_SECONDS + 86400)
+        conn = self.x.connect()
+        try:
+            self.x.sweep(conn)
+            self.assertEqual(int(conn.execute("PRAGMA freelist_count").fetchone()[0]), 0)
+        finally:
+            conn.close()
+        self.assertLess(self.db.stat().st_size, peak // 2, "file did not shrink after deletion")
+
+    def test_vacuum_is_skipped_when_there_is_nothing_to_reclaim(self) -> None:
+        """Keeps the rewrite off the common path: two pragmas and no work."""
+        self.queue("small")
+        conn = self.x.connect()
+        try:
+            self.assertFalse(self.x.reclaim(conn))
+        finally:
+            conn.close()
 
 
 class TestFailOpen(unittest.TestCase):
