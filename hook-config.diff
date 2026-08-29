@@ -1,0 +1,108 @@
+xmsg 需要的 hook 配置改动 —— 供人工审阅后手动应用
+=====================================================
+
+两处都是**纯新增**：新增一个 PreToolUse 事件条目，不触碰任何已有条目，
+也不改动 ~/.agent-memory/hooks/ 下四工具共用的那条链路。
+
+⚠️ 下面 diff 里的 `/home/llm` 是原作者机器的 home，照抄前替换成你自己的。
+   已有条目（gitlab-issues-check.sh / codex-hook.sh）只是上下文行，用于说明
+   新条目插在哪，你机器上没有它们也不影响 —— 只需保证 hooks 对象里
+   多出一个 PreToolUse 事件、command 指向你 clone 出来的 xmsg-hook.sh。
+   xmsg.py 与 xmsg-hook.sh 自身走 $HOME / Path.home()，无需改路径。
+
+应用前建议先备份：
+  cp ~/.claude/settings.json ~/.claude/settings.json.before-xmsg
+  cp ~/.codex/hooks.json    ~/.codex/hooks.json.before-xmsg
+（注意 ~/.gitignore 里 *.before-* 已被排除，备份不会进 dotfiles。）
+
+应用后验证：
+  xmsg doctor            # 库可达
+  xmsg list              # 新起一个会话跑一次工具调用，它应出现在这里
+
+
+--- a/home/llm/.claude/settings.json
++++ b/home/llm/.claude/settings.json
+@@ hooks @@
+     "SessionStart": [
+       {
+         "hooks": [
+           {
+             "type": "command",
+             "command": "/home/llm/.claude/hooks/gitlab-issues-check.sh",
+             "timeout": 10
+           }
+         ]
+       }
+-    ]
++    ],
++    "PreToolUse": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "/home/llm/agent-msg/xmsg-hook.sh claude",
++            "timeout": 5
++          }
++        ]
++      }
++    ]
+   },
+
+
+--- a/home/llm/.codex/hooks.json
++++ b/home/llm/.codex/hooks.json
+@@ hooks @@
+     "Stop": [
+       {
+         "hooks": [
+           {
+             "type": "command",
+             "command": "/home/llm/.agent-memory/hooks/codex-hook.sh Stop",
+             "timeout": 5
+           }
+         ]
+       }
+-    ]
++    ],
++    "PreToolUse": [
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "/home/llm/agent-msg/xmsg-hook.sh codex",
++            "timeout": 5
++          }
++        ]
++      }
++    ]
+   }
+ }
+
+
+几点说明
+--------
+
+1. Codex 侧没写 matcher。PreToolUse 的 matcher 匹配的是 tool_name，
+   而消息投递跟接收方正要调哪个工具无关 —— 任何一次工具调用都是同样好的投递时机。
+   写窄了只会让「刚好只用了没被匹配到的工具」的那一轮收不到消息。
+
+2. timeout 都写 5（host 侧预算）；xmsg-hook.sh 自己在 3s 就切断，
+   所以正常情况永远碰不到 host 的这个上限。两层是刻意的：
+   内层保证 host 不必动用超时机制，外层是 host 对 hook 不守规矩的最后防线。
+
+3. Codex 首次加载新 hook 会要求信任确认。
+   交互式会话里确认一次即可；非交互跑要带 --dangerously-bypass-hook-trust。
+
+4. 现存的 trusted_hash 不会失效。~/.codex/config.toml 里的键长这样：
+
+     [hooks.state."/home/llm/.codex/hooks.json:session_start:0:0"]
+     [hooks.state."/home/llm/.codex/hooks.json:session_start:1:0"]
+     [hooks.state."/home/llm/.codex/hooks.json:stop:0:0"]
+
+   即「配置路径 : 事件名(snake_case) : 事件内的组索引 : 组内 hook 索引」——
+   索引是**事件内**编号，不是全局顺序（session_start 的 :0:0 和 :1:0 正对应
+   hooks.json 里 SessionStart 下的两个 matcher 组）。所以新增一个 pre_tool_use
+   事件只会多出一个新键，已有五个条目的键名与哈希都不动，不会重新要求确认。
+
+5. Claude 侧这条已在独立 settings 文件里实测通过（--settings 隔离），
+   Codex 侧已在独立 CODEX_HOME 里实测通过。两边都不是推演。

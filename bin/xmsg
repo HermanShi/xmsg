@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# xmsg - cross-session message delivery between agent sessions.
+#
+# Thin dispatcher; all logic lives in ~/agent-msg/xmsg.py. Kept separate so the
+# hook config can point at a stable path in PATH while the implementation moves.
+#
+#   xmsg list                       which sessions can receive right now
+#   xmsg send <session|prefix> "…"  queue a message
+#   xmsg outbox                     did it land?
+#   xmsg doctor                     config + queue health
+#
+# The `hook` subcommand is for host hook configs, not for humans.
+exec /usr/bin/python3 "${XMSG_IMPL:-$HOME/agent-msg/xmsg.py}" "$@"
