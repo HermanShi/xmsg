@@ -90,10 +90,20 @@ Claude 侧两个条目，对应两个投递窗口（缺一个不会坏，只是�
              "command": "/home/llm/.agent-memory/hooks/codex-hook.sh Stop",
              "timeout": 5
            }
-         ]
-       }
--    ]
-+    ],
+-        ]
+-      }
++        ]
++      },
++      {
++        "hooks": [
++          {
++            "type": "command",
++            "command": "/home/llm/agent-msg/xmsg-hook.sh codex",
++            "timeout": 5
++          }
++        ]
++      }
+     ],
 +    "PreToolUse": [
 +      {
 +        "hooks": [
@@ -107,6 +117,12 @@ Claude 侧两个条目，对应两个投递窗口（缺一个不会坏，只是�
 +    ]
    }
  }
+
+⚠️ Codex 侧新增条目后**必须起一次交互式 codex 会话确认信任**，否则被静默跳过。
+   Codex 把每个 hook 条目的哈希记在 config.toml 的
+   [hooks.state."<hooks.json 绝对路径>:<event>:<组下标>:<hook 下标>"] 下，
+   未授信的条目不报错、不提示，直接不执行 —— 看起来就像配置没写对。
+   验证方式是数 `hook: Stop` 出现几次（2 = 两条都跑），不是看有没有报错。
 
 
 几点说明

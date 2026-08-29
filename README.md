@@ -331,6 +331,27 @@ Claude Code 确实有一套 Unix domain socket 传输：每个进程在
 | 工具 | 可用投递窗口 | 状态 |
 | --- | --- | --- |
 | Claude Code | `PreToolUse` + `Stop` | 已接，两者均实测通过 |
-| Codex CLI 0.150.1 | `PreToolUse`（12 个 hook 事件之一） | 已接，实测通过。`Stop` 的退出码分级未实测，故未接 |
+| Codex CLI 0.150.1 | `PreToolUse` + `Stop` | 两者均实测通过。`Stop` 与 Claude 完全同构：payload 带 `stop_hook_active`/`last_assistant_message`，`decision:block` 被采纳（日志打 `hook: Stop Blocked`）。⚠️ 新增 hook 条目需一次交互式信任确认，见下 |
 | Cursor Agent | 无 | 只有 `sessionStart` 能注入；`beforeSubmitPrompt` 的 output 只支持 `continue`/`user_message`，官方文档明确不支持 context 注入。要接只能降级成开会话时投一次。 |
 | Antigravity / Gemini | 未知 | 本机没装，没有实测依据，故未实现。 |
+
+### Codex 的 hook 信任门槛（栽过两次的坑）
+
+Codex 把每个 hook 条目的哈希记在 `~/.codex/config.toml` 的
+`[hooks.state."<hooks.json 绝对路径>:<event>:<组下标>:<hook 下标>"]` 下。
+**未授信的条目被静默跳过 —— 不报错、不提示，看起来就像 hook 没写对。**
+
+两次踩法：
+
+1. 隔离 `CODEX_HOME` 做测试时，拷进去的 `config.toml` 里那些键锚定的是
+   **原来那个绝对路径**，新位置的 hooks.json 一条都不信任 → 全部静默跳过。
+   测试场景加 `--dangerously-bypass-hook-trust` 即可。
+2. 往已有 `Stop` 数组追加第二组后，它是个新键（`stop:1:0`），同样未授信 →
+   实测不带 bypass 只跑 1 个 Stop hook，带 bypass 跑 2 个。已有条目的哈希不受影响，
+   agent-memory 那条照常工作。
+
+**授信要走一次交互式会话确认**（`codex` 交互模式起一次，它会问）。
+没有非交互的授信子命令；手工往 `config.toml` 写 `trusted_hash` 等于替自己伪造一条
+信任记录、跳过 Codex 特意设的审阅环节 —— 别那么干。
+
+判断某条到底生效没有：数 `hook: <Event>` 出现几次，而不是看有没有报错。
