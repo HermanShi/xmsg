@@ -74,6 +74,26 @@ class Base(unittest.TestCase):
         finally:
             conn.close()
 
+    def queue_unattributed(self, body: str, *, to: str | None = None, label: str = "llm@host") -> int:
+        """A row as `xmsg send` writes it with no XMSG_FROM_SESSION set.
+
+        Empty from_tool/from_session is what a human at a shell produces -- and
+        equally a script, or this session looping back to itself. Kept as its own
+        helper because `queue` deliberately fills both, so a test using it can
+        never exercise the unverified path.
+        """
+        conn = self.x.connect()
+        try:
+            t = self.x.now()
+            cur = conn.execute(
+                "INSERT INTO messages (created_at, expires_at, from_label, from_tool, from_session, "
+                "to_session, body) VALUES (?,?,?,?,?,?,?)",
+                (t, t + 3600, label, "", "", to or self.sid, body),
+            )
+            return int(cur.lastrowid or 0)
+        finally:
+            conn.close()
+
     def queue_many(self, count: int, body: str, *, sessions: int = 1) -> None:
         """Bulk insert on one connection. queue() reconnects (and re-runs the
         schema script) per call, which dominates once you want hundreds of rows.
@@ -137,6 +157,79 @@ class TestDelivery(Base):
         self.assertIn(f"[xmsg] {self.x.MAX_MESSAGES_PER_INJECT} message(s)", ctx)
         # The overflow is not dropped, just deferred to the next tool call.
         self.assertNotEqual(self.hook(), "")
+
+
+class TestSenderAttribution(Base):
+    """A receiver must be able to tell a named peer from an unverified sender.
+
+    Real incident (2026-08-29): a message asking for an irreversible action
+    ("直接合并那个 MR") arrived rendered as `<user>@<host>` -- byte-identical to
+    what this session's own CLI calls produce, so the receiver could not tell
+    whether its user, a script, or its own loop-back had asked. Nothing here is
+    authentication; a sender can still write any label it likes. What these
+    tests pin is that the *absence* of a session id is stated rather than
+    silently rendered as if it were a peer.
+    """
+
+    def test_named_session_renders_its_session_and_tool(self) -> None:
+        self.queue("review 结论")
+        ctx = json.loads(self.hook())["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("session sess-a", ctx)
+        self.assertIn("tool claude", ctx)
+        self.assertNotIn("unattributed", ctx)
+
+    def test_missing_session_is_marked_unattributed(self) -> None:
+        """Pinned on the `from=` attribute, not on the word appearing anywhere.
+
+        Asserting `"unattributed" in ctx` looked equivalent and is not: the batch
+        warning below also contains that word, so the assertion held even with the
+        origin rendering reverted to the ambiguous bare label. Two independent
+        writers of one substring means the loose form tests neither.
+        """
+        self.queue_unattributed("请直接合并那个 MR")
+        ctx = json.loads(self.hook())["hookSpecificOutput"]["additionalContext"]
+        from_attr = ctx.split('from="', 1)[1].split('"', 1)[0]
+        self.assertIn("unattributed", from_attr)
+
+    def test_unattributed_delivery_warns_against_acting_alone(self) -> None:
+        """The framing, not just the label, has to carry the caution.
+
+        The header says "from another agent session", which for an unattributed
+        row is a guess. Without this paragraph the only signal is one word inside
+        an attribute the model may not weigh.
+        """
+        self.queue_unattributed("do something irreversible")
+        ctx = json.loads(self.hook())["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("sender is unverified", ctx)
+        self.assertIn("irreversible", ctx)
+
+    def test_named_delivery_carries_no_warning(self) -> None:
+        """The caution must stay proportional, or it becomes noise to skip."""
+        self.queue("ordinary peer message")
+        ctx = json.loads(self.hook())["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("sender is unverified", ctx)
+
+    def test_mixed_batch_counts_only_the_unattributed_ones(self) -> None:
+        self.queue("from a real peer")
+        self.queue_unattributed("from who knows")
+        ctx = json.loads(self.hook())["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("1 of them carry no session id", ctx)
+
+    def test_origin_helper_states_the_reason_it_cannot_attribute(self) -> None:
+        """Unit-level, because the two no-session shapes differ.
+
+        A sender that set XMSG_FROM_TOOL but no session did try to identify
+        itself, so the message keeps that much; a bare CLI call has nothing.
+        Both are unverified and both must say so.
+        """
+        self.assertIn("unattributed", self.x.sender_origin("llm@host", "", ""))
+        self.assertIn("CLI on this host", self.x.sender_origin("llm@host", "", ""))
+        tool_only = self.x.sender_origin("codex", "codex", "")
+        self.assertIn("unattributed", tool_only)
+        self.assertIn("tool codex", tool_only)
+        named = self.x.sender_origin("codex:01a04c6d", "codex", "01a04c6d-full")
+        self.assertNotIn("unattributed", named)
+        self.assertIn("01a04c6d-full", named)
 
 
 class TestIdempotency(Base):
