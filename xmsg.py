@@ -5,13 +5,22 @@ Two halves, one file:
 
   * sender side   `xmsg send <to> <text>`  writes a row into a standalone
     SQLite file. Nothing else happens at that moment.
-  * receiver side `xmsg hook --tool codex` runs from the host's PreToolUse
-    hook. It registers the calling session as a live peer, claims any
-    undelivered messages addressed to it, and prints them back to the host as
-    `hookSpecificOutput.additionalContext`. The host splices that text into the
-    model's context before the tool call it was about to make - so the receiver
-    sees the message inside the turn that is already running, without ever
-    asking whether it has mail.
+  * receiver side `xmsg hook --tool codex` runs from the host's hooks. It
+    registers the calling session as a live peer, claims any undelivered
+    messages addressed to it, and hands them back to the host - so the receiver
+    sees the message without ever asking whether it has mail.
+
+Two delivery windows, because one is not enough to cover a session's life:
+
+  * PreToolUse - the turn is running and about to call a tool. Output is
+    `hookSpecificOutput.additionalContext`, spliced in before that call.
+  * Stop - the turn is finishing and has no tool call left to attach to. Output
+    is `{"decision": "block", "reason": ...}`, which restarts the turn with the
+    message as context. This is what covers "the session was about to go idle".
+
+There is no third window: a session sitting idle with no turn in flight runs no
+hooks at all, so nothing can reach it until the user speaks or a peer message
+arrives while a turn is still alive. See "投递窗口" in README.md.
 
 Why a separate database: ~/.agent-memory/index.sqlite3 is mirrored on a
 one-minute systemd timer and rebuilt from Markdown; message rows have neither
@@ -412,13 +421,31 @@ def render(rows: list[sqlite3.Row]) -> str:
 
 
 def hook_body(tool: str, raw: str) -> str:
-    """The whole receiver path, minus the fail-open wrapper. Returns stdout."""
+    """The whole receiver path, minus the fail-open wrapper. Returns stdout.
+
+    Two output shapes, because the two events that carry a delivery are read
+    differently by the host:
+
+      * PreToolUse -> hookSpecificOutput.additionalContext, spliced in before
+        the tool call the turn was about to make.
+      * Stop -> {"decision": "block", "reason": ...}. At Stop the turn has no
+        further tool call to attach to, so additionalContext has nowhere to
+        land; `block` is the only output that reaches the model, and it does so
+        by restarting the turn with `reason` as the new context. That makes the
+        moment a session goes idle a delivery window too - see WINDOWS below.
+    """
     payload = json.loads(raw) if raw.strip() else {}
     if not isinstance(payload, dict):
         return ""
     event = str(payload.get("hook_event_name") or "PreToolUse")
     session_id = str(payload.get("session_id") or "")
     if not session_id:
+        return ""
+
+    # The turn we would restart is itself one the Stop hook already restarted.
+    # Delivering again here is how you get an unbreakable block loop, so this
+    # guard is load-bearing, not defensive. Claim nothing, register nothing.
+    if event == "Stop" and payload.get("stop_hook_active"):
         return ""
 
     conn = connect()
@@ -430,6 +457,11 @@ def hook_body(tool: str, raw: str) -> str:
 
     if not rows:
         return ""
+    if event == "Stop":
+        return json.dumps(
+            {"decision": "block", "reason": render(rows)},
+            ensure_ascii=False,
+        )
     return json.dumps(
         {
             "hookSpecificOutput": {

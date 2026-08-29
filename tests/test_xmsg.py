@@ -251,6 +251,71 @@ class TestPeerRegistry(Base):
             conn.close()
 
 
+class TestStopWindow(Base):
+    """The second delivery window: the moment a turn ends and goes idle.
+
+    PreToolUse only fires if the turn makes another tool call. A turn that is
+    finishing has none left, so Stop is the last execution point where anything
+    can still reach the model. Verified end to end against a real session that
+    was told not to call any tool: it reported back a nonce it could only have
+    got from a Stop delivery.
+    """
+
+    def stop(self, *, active: bool = False, tool: str = "claude") -> str:
+        payload = dict(PAYLOAD, hook_event_name="Stop", stop_hook_active=active)
+        payload.pop("tool_name", None)
+        return self.x.hook_body(tool, json.dumps(payload))
+
+    def test_stop_delivers_as_a_block_decision_not_additional_context(self) -> None:
+        """At Stop there is no pending tool call, so additionalContext has
+        nowhere to land. `block` is the only output the model actually sees."""
+        self.queue("NONCE-UNIT-STOP-1")
+        out = json.loads(self.stop())
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("NONCE-UNIT-STOP-1", out["reason"])
+        self.assertNotIn("hookSpecificOutput", out)
+
+    def test_stop_delivery_keeps_the_peer_framing(self) -> None:
+        self.queue("do the thing")
+        reason = json.loads(self.stop())["reason"]
+        self.assertIn("<cross-session-message", reason)
+        self.assertIn("NOT instructions from your user", reason)
+
+    def test_stop_with_nothing_queued_lets_the_session_go_idle(self) -> None:
+        """No message must never mean a blocked Stop, or turns stop ending."""
+        self.assertEqual(self.stop(), "")
+
+    def test_stop_hook_active_delivers_nothing(self) -> None:
+        """Guard against the block loop: the turn we would restart is one this
+        hook already restarted, so a second delivery never terminates."""
+        self.queue("NONCE-UNIT-STOP-LOOP")
+        self.assertEqual(self.stop(active=True), "")
+
+    def test_stop_hook_active_does_not_consume_the_message(self) -> None:
+        """Suppressing that delivery must not eat the message: it stays queued
+        for the restarted turn's own first tool call."""
+        self.queue("NONCE-UNIT-STOP-KEEP")
+        self.assertEqual(self.stop(active=True), "")
+        self.assertIn("NONCE-UNIT-STOP-KEEP", self.hook())
+
+    def test_stop_and_pretooluse_share_the_at_most_once_claim(self) -> None:
+        """Two windows, still one delivery - whichever fires first wins."""
+        self.queue("NONCE-UNIT-STOP-ONCE")
+        self.assertIn("NONCE-UNIT-STOP-ONCE", self.hook())
+        self.assertEqual(self.stop(), "", "Stop re-delivered an already claimed message")
+
+    def test_delivered_row_records_the_stop_event(self) -> None:
+        mid = self.queue("x")
+        self.stop()
+        conn = self.x.connect()
+        try:
+            row = conn.execute("SELECT * FROM messages WHERE id = ?", (mid,)).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["delivered_event"], "Stop")
+        self.assertEqual(row["delivered_tool"], "claude")
+
+
 class TestSweep(Base):
     def test_sweep_expires_a_message_past_its_ttl(self) -> None:
         mid = self.queue("stale", ttl=-1)

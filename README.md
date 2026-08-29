@@ -2,7 +2,7 @@
 
 让一个 agent 会话给另一个会话发消息，**接收方在当前这一轮里就能看到**，不需要主动查信箱。
 
-支持 Claude Code 与 Codex CLI（两者的 `PreToolUse` 都能注入上下文）。
+支持 Claude Code 与 Codex CLI。
 
 ```
 A 会话:  xmsg send <B的session> "..."      → 写一行到 SQLite，就结束了
@@ -12,7 +12,49 @@ B 会话:  ...正在跑第 3 个工具调用...
 ```
 
 不是轮询：投递方写完即返回，接收方不问「有没有新消息」。推力来自 host 自己在
-`PreToolUse` 时点执行 hook 这个既有行为。
+既有时点执行 hook 这个行为。
+
+## 投递窗口（以及为什么没有第三个）
+
+hook 只在 host 调它的时候才跑，所以「能投递的时刻」完全由 host 的事件表决定。
+两个窗口，覆盖一轮的两端：
+
+| 窗口 | 触发时机 | 输出形式 | 模型怎么看到 |
+| --- | --- | --- | --- |
+| `PreToolUse` | 一轮正在跑，即将调工具 | `hookSpecificOutput.additionalContext` | 拼进那次工具调用前的上下文 |
+| `Stop` | 一轮正要收尾、转 idle | `{"decision":"block","reason":…}` | 带着消息重启这一轮 |
+
+**为什么两个都要**：`PreToolUse` 只在这一轮还会再调工具时才有机会。一轮临近结束时
+没有下一次工具调用了，`Stop` 就是最后一个还能触达模型的执行点 —— 它盖住的正是
+「会话马上要 idle 了」这一段。实测：真实会话里明确要求「不要调用任何工具」，
+`PreToolUse` 一次都没触发，消息仍通过 `Stop` 投达（`last_assistant_message`
+已经是最终答案，说明 turn 真的在收尾）。
+
+`Stop` 这一路只能用 `decision: block`，不能用 `additionalContext` ——
+此刻没有待发的工具调用，`additionalContext` 无处可拼。`block` 是唯一能让内容
+进到模型眼前的输出，代价是它以「重启这一轮」的方式实现。
+
+**`stop_hook_active` 守卫是承重的，不是防御性代码**：被 block 重启的那一轮结束时
+`Stop` 会再触发一次，此时 payload 里 `stop_hook_active=true`。不据此放行就是一个
+永不终止的 block 循环。实测两次触发分别为 `false` / `true`，守卫生效。
+该守卫**不消费消息** —— 被抑制的那次不领取，消息留给重启后那一轮的首次工具调用。
+
+### 没有第三个窗口
+
+**一个真正 idle、没有任何 turn 在飞的会话不执行任何 hook**，所以在用户开口之前，
+没有任何机制能把消息推进去。这不是本工具的短板，是 hook 模型的边界：
+
+- Claude Code 的 hook 事件表里**没有** idle 事件。二进制里那三处 `"Idle"` 是状态栏
+  文案（`status:"Idle"`、`{word:"Idle",dim:!0}`），不是 hook 事件。可用事件是
+  `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`/`SessionEnd`/`Stop`/
+  `SubagentStart`/`SubagentStop`/`PreCompact`/`PostCompact`/`Notification`/
+  `PermissionRequest` —— 其中 `Stop` 是**执行时点最靠后**的那个。
+- Claude 自带的 `SendMessage` 也是同一个天花板，它的契约原文是 "messages enqueue
+  and drain at the receiver's **next tool round**"。所以「能不能像自带工具那样在
+  idle 状态收消息」这个问法本身有个错误前提 —— 自带工具也不能。
+
+实践含义：**投递要趁对方还活着**。`xmsg list` 列出的就是这种会话；
+消息投不出去时靠 TTL 放弃，而不是无限期等一个可能再也不跑 turn 的会话。
 
 ## 安装
 
@@ -28,7 +70,9 @@ clone 到 `~/agent-msg` 以外的路径也行，此时给两个 host 的 hook �
 `XMSG_IMPL` 指对位置即可（默认值回落到 `$HOME/agent-msg/xmsg.py`）。
 
 最后按 `hook-config.diff` 手工加 hook 条目 —— **不加 hook 只能发不能收**，
-因为投递靠的就是接收方 host 在 `PreToolUse` 时点执行 hook。
+因为投递靠的就是接收方 host 在既有时点执行 hook。`PreToolUse` 和 `Stop` 两个条目
+指向同一个 `xmsg-hook.sh`，事件名从 payload 里读，不靠参数区分。
+只加 `PreToolUse` 也能用，代价是丢掉「对方正要 idle」那个窗口。
 
 ## 装在哪
 
@@ -37,7 +81,7 @@ clone 到 `~/agent-msg` 以外的路径也行，此时给两个 host 的 hook �
 | `~/agent-msg/xmsg.py` | 全部逻辑（发送端 CLI + 接收端 hook），单文件无依赖 |
 | `~/agent-msg/xmsg-hook.sh` | hook 入口，负责 fail-open 与超时兜底 |
 | `~/agent-msg/bin/xmsg` | 薄 dispatcher，软链进 PATH 后就是命令名 `xmsg` |
-| `~/agent-msg/tests/test_xmsg.py` | 36 个测试 |
+| `~/agent-msg/tests/test_xmsg.py` | 43 个测试 |
 | `~/.local/share/agent-msg/messages.sqlite3` | 消息队列（本机运行态，不进版本库） |
 
 消息库**故意不用** `~/.agent-memory/index.sqlite3`：那个库每分钟被 systemd timer
@@ -155,11 +199,12 @@ hook 报 Errno 2。第二、三行兜底是冗余的，属于纵深防御而非�
 ## 跑测试
 
 ```bash
-python3 -m pytest ~/agent-msg/tests/test_xmsg.py -q     # 36 passed, 3 subtests passed
+python3 -m pytest ~/agent-msg/tests/test_xmsg.py -q     # 43 passed, 3 subtests passed
 ```
 
 覆盖投递、幂等（含 8 线程并发只准一条命中）、定址（前缀/歧义/广播/过期 peer）、
-TTL 清理、fail-open 8 例、CLI 端到端 7 例。
+`Stop` 窗口 7 例（block 输出形式、防循环守卫、守卫不吃消息、两窗口共享
+at-most-once）、TTL 清理、fail-open 8 例、CLI 端到端 7 例。
 
 测试里 `run_hook` 会强制设 `XMSG_IMPL` 指向被测副本。**这行不能删**：
 `xmsg-hook.sh` 的 `$impl` 默认回落到 `$HOME/agent-msg/xmsg.py`，不固定的话
@@ -183,14 +228,44 @@ TTL 清理、fail-open 8 例、CLI 端到端 7 例。
 
 ## Hook 配置
 
-需要手工加到两个 host 的配置里，见 `hook-config.diff`。两处都是**新增独立条目**，
+需要手工加到两个 host 的配置里，见 `hook-config.diff`。都是**新增独立条目**，
 不改动 `~/.agent-memory/hooks/` 那条四工具共用的链路。
+
+## 为什么不用 UDS（Claude 自己用的那套）
+
+Claude Code 确实有一套 Unix domain socket 传输：每个进程在
+`/run/user/<uid>/cc-socks/<pid>.sock` 上监听，地址以 `uds:` 为 scheme
+（另有 `bridge:` / `did:`），带 `verifiedPeerPid` 与 `peerDirOwnerUids` 做对端校验。
+本机实测确实存在，且监听者就是各个 `claude` 进程。
+
+**但它解决的不是同一个问题。** 换成 UDS 帮不到我们，原因有三层：
+
+1. **UDS 决定"消息怎么送到进程"，不决定"消息怎么进到模型上下文"。** socket 那头
+   收到字节的是 host 进程，而 host 把内容拼进模型上下文，仍然只在它自己的那几个
+   时点做 —— 所以 Claude 自带的 `SendMessage` 尽管走 UDS，契约依然是 "drain at the
+   receiver's **next tool round**"。换传输不会多出一个投递窗口，
+   上面「没有第三个窗口」那条限制照旧。
+
+2. **我们没有那个 socket 的协议，也进不去别人的进程。** `cc-socks` 是 Claude Code
+   的内部端点，帧格式未公开、随版本变，且它按 `verifiedPeerPid` 校验对端。
+   xmsg 是**外部**工具，唯一被 host 认可的入口就是 hook 的 stdin/stdout —— 那本身
+   已经是一条进程间通道，只不过由 host 主动发起。自己再起一个 socket 也没用：
+   对面的 host 不会去连它。
+
+3. **per-PID socket 的生命周期比消息短。** 实测 `73493.sock` 的属主进程已经死了，
+   socket 还留在目录里 —— 连上去也没人应答。而 xmsg 要支持的正是「先排消息、
+   对方稍后收」，队列必须活得比任何一个进程久。SQLite 文件天然满足，
+   socket 天然不满足；真用 socket 就得在旁边再补一个持久队列，
+   于是绕回今天这个设计，只是多了一层。
+
+结论：**传输层不是瓶颈，hook 时点才是。** 已经做的两件事（补上 `Stop` 窗口、
+`xmsg list` 只列还活着的会话）都作用在真正的约束上。
 
 ## 工具支持边界
 
-| 工具 | 每轮注入 | 状态 |
+| 工具 | 可用投递窗口 | 状态 |
 | --- | --- | --- |
-| Claude Code | `UserPromptSubmit` + `PreToolUse` | 已接，实测通过 |
-| Codex CLI 0.150.1 | `PreToolUse`（12 个 hook 事件之一） | 已接，实测通过 |
+| Claude Code | `PreToolUse` + `Stop` | 已接，两者均实测通过 |
+| Codex CLI 0.150.1 | `PreToolUse`（12 个 hook 事件之一） | 已接，实测通过。`Stop` 的退出码分级未实测，故未接 |
 | Cursor Agent | 无 | 只有 `sessionStart` 能注入；`beforeSubmitPrompt` 的 output 只支持 `continue`/`user_message`，官方文档明确不支持 context 注入。要接只能降级成开会话时投一次。 |
 | Antigravity / Gemini | 未知 | 本机没装，没有实测依据，故未实现。 |
