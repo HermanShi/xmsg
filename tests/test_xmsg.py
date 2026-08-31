@@ -10,6 +10,8 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -576,6 +578,357 @@ class TestSweep(Base):
             self.assertFalse(self.x.reclaim(conn))
         finally:
             conn.close()
+
+
+class TestEnvelope(Base):
+    """The `<cross-session-message>` element handed to the host's own socket.
+
+    Claude re-renders what it parsed and compares it to the input, so an
+    attribute holding a character outside its class does not merely get ignored:
+    the whole envelope fails to parse and the message degrades to unattributed.
+    These tests pin the shape rather than trusting that.
+    """
+
+    def test_attributes_are_emitted_in_host_order(self) -> None:
+        env = self.x.envelope("hi", label="peer-a", from_session="sess-a", from_mode="bypass")
+        self.assertEqual(
+            env,
+            '<cross-session-message from="peer-a" from-session="sess-a" '
+            'from-mode="bypass">\nhi\n</cross-session-message>',
+        )
+
+    def test_body_is_isolated_on_its_own_lines(self) -> None:
+        # The host's regex anchors the body between newlines; a body glued to the
+        # tags fails to match and the message arrives unattributed.
+        env = self.x.envelope("line1\nline2", label="p", from_session="s", from_mode="bypass")
+        self.assertIn(">\nline1\nline2\n</", env)
+
+    def test_session_id_outside_the_class_is_dropped_not_emitted(self) -> None:
+        # Better to lose the attribute than to void the envelope carrying it.
+        env = self.x.envelope("hi", label="peer-a", from_session="not a valid id!", from_mode="bypass")
+        self.assertNotIn("from-session", env)
+        self.assertIn('from="peer-a"', env)
+
+    def test_label_outside_the_class_is_dropped(self) -> None:
+        env = self.x.envelope("hi", label="péer a", from_session="sess-a", from_mode="bypass")
+        self.assertNotIn("from=", env.split(">")[0].replace("from-session", ""))
+        self.assertIn('from-session="sess-a"', env)
+
+    def test_unknown_mode_is_not_claimed(self) -> None:
+        env = self.x.envelope("hi", label="p", from_session="s", from_mode="whatever")
+        self.assertNotIn("from-mode", env)
+
+    def test_no_attributes_still_renders(self) -> None:
+        env = self.x.envelope("hi", label="", from_session="", from_mode="")
+        self.assertEqual(env, "<cross-session-message>\nhi\n</cross-session-message>")
+
+
+class TestClaimedMode(Base):
+    """Mapping a host permission mode onto the class the receiver compares.
+
+    An empty result is the meaningful case: it means "this sender attested
+    nothing", which is what makes a bypass-mode receiver park the message for
+    human review. Filling in a default here would forge an attestation.
+    """
+
+    def test_bypass_maps_to_bypass(self) -> None:
+        self.assertEqual(self.x.claimed_mode("bypassPermissions"), "bypass")
+
+    def test_prompting_modes_map_to_prompting(self) -> None:
+        for mode in ("default", "plan", "ask", "acceptEdits"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.x.claimed_mode(mode), "prompting")
+
+    def test_absent_or_unknown_claims_nothing(self) -> None:
+        for mode in ("", "something-new", "BYPASSPERMISSIONS"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.x.claimed_mode(mode), "")
+
+    def test_sender_with_no_peer_row_claims_nothing(self) -> None:
+        conn = self.x.connect()
+        try:
+            self.assertEqual(self.x.sender_claimed_mode(conn, "nobody"), "")
+            self.assertEqual(self.x.sender_claimed_mode(conn, ""), "")
+        finally:
+            conn.close()
+
+    def test_sender_mode_is_read_from_its_own_peer_row(self) -> None:
+        # The mode belongs to the sending session, not to the shell running the
+        # command, so it is read back from what that session reported.
+        self.hook(tool="claude")
+        conn = self.x.connect()
+        try:
+            self.assertEqual(self.x.sender_claimed_mode(conn, self.sid), "bypass")
+        finally:
+            conn.close()
+
+
+class DirectBase(Base):
+    """Shared scaffolding: a live process that is not the test process itself.
+
+    direct_send refuses to write to its own pid (a session must never be handed
+    its own message back as a peer's), so every test that wants a *successful*
+    or "live but unreachable" path needs a real third process to aim at.
+    """
+
+    def spawn_target(self) -> int:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        # Wait for /proc to be readable; without this pid_start_time can race the
+        # fork and read None, which would make the test refuse for the wrong reason.
+        for _ in range(200):
+            if self.x.pid_start_time(proc.pid) is not None:
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(self.x.pid_start_time(proc.pid), "target process never appeared")
+        return proc.pid
+
+
+class TestDirectDeliveryTargeting(DirectBase):
+    """Who direct delivery will and will not write to.
+
+    Every refusal below leaves the row queued, so the hook path still delivers
+    it. That is the whole safety argument for this feature: it can only ever be
+    faster than the queue, never a way to lose a message.
+    """
+
+    def peer_row(self, **over):
+        pid = self.spawn_target()
+        base = {"pid": pid, "pid_start": self.x.pid_start_time(pid),
+                "sock_path": "", "tool": "claude", "permission_mode": "bypassPermissions"}
+        base.update(over)
+        return base
+
+    def test_no_pid_recorded_is_refused(self) -> None:
+        ok, detail = self.x.direct_send(
+            self.peer_row(pid=None), "hi", label="p", from_session="s", from_mode="bypass"
+        )
+        self.assertFalse(ok)
+        self.assertIn("no pid", detail)
+
+    def test_dead_pid_is_refused(self) -> None:
+        # A pid nothing owns: /proc has no entry, so there is nobody to deliver to.
+        dead = 4194303
+        ok, detail = self.x.direct_send(
+            self.peer_row(pid=dead, pid_start=1), "hi", label="p", from_session="s", from_mode="bypass"
+        )
+        self.assertFalse(ok)
+        self.assertIn("gone", detail)
+
+    def test_recycled_pid_is_refused(self) -> None:
+        # Same pid number, different start time: the session that owned this pid
+        # exited and something else took the slot. Delivering here would put the
+        # message in a stranger's context.
+        row = self.peer_row(pid_start=1)
+        ok, detail = self.x.direct_send(row, "hi", label="p", from_session="s", from_mode="bypass")
+        self.assertFalse(ok)
+        self.assertIn("recycled", detail)
+
+    def test_live_pid_without_socket_is_refused(self) -> None:
+        # The test process itself is alive but is not a Claude host, so it has no
+        # inbound socket. Nothing to connect to, so the message stays queued.
+        ok, detail = self.x.direct_send(
+            self.peer_row(), "hi", label="p", from_session="s", from_mode="bypass"
+        )
+        self.assertFalse(ok)
+        self.assertIn("no live socket", detail)
+
+    def test_codex_peer_is_left_to_the_hook_path(self) -> None:
+        # Only Claude Code exposes this socket; a Codex session is addressed the
+        # same way but reached only by its hooks.
+        conn = self.x.connect()
+        try:
+            pid = self.spawn_target()
+            conn.execute(
+                "INSERT INTO peers (session_id, tool, pid, pid_start, first_seen_at, last_seen_at) "
+                "VALUES ('sess-codex','codex',?,?,?,?)",
+                (pid, self.x.pid_start_time(pid), self.x.now(), self.x.now()),
+            )
+            mid = self.queue("hi", to="sess-codex")
+            out = self.x.direct_deliver(conn, [mid], ["sess-codex"], "hi", "p", "sess-a")
+            self.assertFalse(out[mid][0])
+            self.assertIn("no inbound socket", out[mid][1])
+            row = conn.execute("SELECT delivered_at FROM messages WHERE id = ?", (mid,)).fetchone()
+            self.assertIsNone(row["delivered_at"], "a refused direct send must leave the row queued")
+        finally:
+            conn.close()
+
+    def test_unknown_peer_is_skipped_without_a_verdict(self) -> None:
+        conn = self.x.connect()
+        try:
+            mid = self.queue("hi", to="sess-nowhere")
+            out = self.x.direct_deliver(conn, [mid], ["sess-nowhere"], "hi", "p", "sess-a")
+            self.assertNotIn(mid, out)
+        finally:
+            conn.close()
+
+
+class TestDirectDeliveryOverSocket(DirectBase):
+    """Direct delivery against a stand-in listener on a real unix socket.
+
+    A fake host cannot prove Claude accepts the bytes -- only the end-to-end run
+    against a live session does that -- but it does pin the wire shape, and it
+    pins that a successful write claims the row so the hook cannot deliver it a
+    second time.
+    """
+
+    def listener(self, path: Path) -> tuple[threading.Thread, list]:
+        got: list = []
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(path))
+        srv.listen(1)
+
+        def serve() -> None:
+            try:
+                conn, _ = srv.accept()
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                got.append(buf)
+                conn.close()
+            except OSError:
+                pass
+            finally:
+                srv.close()
+
+        th = threading.Thread(target=serve, daemon=True)
+        th.start()
+        return th, got
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Point the module's socket lookup at a scratch directory so the test
+        # never touches a real session's socket.
+        self.sockdir = self.tmp / "cc-socks"
+        self.sockdir.mkdir()
+        self.x.SOCK_DIRS = [self.sockdir]
+
+    def test_wire_shape_is_one_json_line(self) -> None:
+        pid = self.spawn_target()
+        th, got = self.listener(self.sockdir / f"{pid}.sock")
+        row = {"pid": pid, "pid_start": self.x.pid_start_time(pid), "sock_path": "",
+               "tool": "claude", "permission_mode": "bypassPermissions"}
+        ok, detail = self.x.direct_send(
+            row, "通报：探针 ZZ-1", label="peer-a", from_session="sess-a", from_mode="bypass"
+        )
+        th.join(timeout=5)
+        self.assertTrue(ok, detail)
+        self.assertEqual(len(got), 1)
+        raw = got[0]
+        self.assertTrue(raw.endswith(b"\n"), "the host reads by line; the write must terminate one")
+        msg = json.loads(raw.decode())
+        self.assertEqual(msg["type"], "user")
+        self.assertEqual(msg["message"]["role"], "user")
+        self.assertIn('from-mode="bypass"', msg["message"]["content"])
+        self.assertIn("通报：探针 ZZ-1", msg["message"]["content"])
+
+    def test_success_claims_the_row_so_the_hook_cannot_resend(self) -> None:
+        pid = self.spawn_target()
+        th, _ = self.listener(self.sockdir / f"{pid}.sock")
+        conn = self.x.connect()
+        try:
+            conn.execute(
+                "INSERT INTO peers (session_id, tool, pid, pid_start, permission_mode, "
+                "first_seen_at, last_seen_at) VALUES (?,?,?,?,?,?,?)",
+                ("sess-live", "claude", pid, self.x.pid_start_time(pid), "bypassPermissions",
+                 self.x.now(), self.x.now()),
+            )
+            mid = self.queue("hi there", to="sess-live")
+            out = self.x.direct_deliver(conn, [mid], ["sess-live"], "hi there", "peer-a", "sess-a")
+            th.join(timeout=5)
+            self.assertTrue(out[mid][0], out[mid][1])
+            row = conn.execute(
+                "SELECT delivered_at, delivered_event FROM messages WHERE id = ?", (mid,)
+            ).fetchone()
+            self.assertIsNotNone(row["delivered_at"])
+            self.assertEqual(row["delivered_event"], "uds-direct")
+        finally:
+            conn.close()
+        # And the hook, running afterwards for that session, finds nothing left.
+        payload = dict(PAYLOAD, session_id="sess-live")
+        self.assertEqual(self.hook(payload, tool="claude"), "")
+
+    def test_refusing_to_deliver_to_the_sending_process(self) -> None:
+        # A session must not be handed its own message: it would read its own
+        # words back as a peer's. Guarded on pid because that is what a loop-back
+        # actually looks like from here.
+        row = {"pid": os.getpid(), "pid_start": self.x.pid_start_time(os.getpid()),
+               "sock_path": "", "tool": "claude", "permission_mode": ""}
+        self.x.SOCK_DIRS = [self.sockdir]
+        (self.sockdir / f"{os.getpid()}.sock").touch()
+        ok, detail = self.x.direct_send(row, "hi", label="p", from_session="s", from_mode="bypass")
+        self.assertFalse(ok)
+        self.assertIn("sending process", detail)
+
+
+class TestPeerDirectColumns(Base):
+    """What the receiver's own hook records so it can be reached directly."""
+
+    def test_hook_records_permission_mode(self) -> None:
+        self.hook(tool="claude")
+        conn = self.x.connect()
+        try:
+            row = conn.execute(
+                "SELECT permission_mode FROM peers WHERE session_id = ?", (self.sid,)
+            ).fetchone()
+            self.assertEqual(row["permission_mode"], "bypassPermissions")
+        finally:
+            conn.close()
+
+    def test_missing_mode_does_not_erase_a_known_one(self) -> None:
+        self.hook(tool="claude")
+        self.hook(dict(PAYLOAD, permission_mode=""), tool="claude")
+        conn = self.x.connect()
+        try:
+            row = conn.execute(
+                "SELECT permission_mode FROM peers WHERE session_id = ?", (self.sid,)
+            ).fetchone()
+            self.assertEqual(row["permission_mode"], "bypassPermissions")
+        finally:
+            conn.close()
+
+    def test_reachable_now_needs_a_live_claude_host(self) -> None:
+        self.assertFalse(self.x.reachable_now({"pid": None, "tool": "claude", "pid_start": None}))
+        self.assertFalse(self.x.reachable_now({"pid": os.getpid(), "tool": "codex", "pid_start": None}))
+        self.assertFalse(
+            self.x.reachable_now({"pid": 4194303, "tool": "claude", "pid_start": 1})
+        )
+
+    def test_migration_adds_columns_to_an_older_database(self) -> None:
+        # A database created before direct delivery existed must gain the columns
+        # rather than fail: CREATE TABLE IF NOT EXISTS never adds one.
+        old = self.tmp / "old.sqlite3"
+        conn = sqlite3.connect(old)
+        conn.executescript(
+            "CREATE TABLE peers (session_id TEXT PRIMARY KEY, tool TEXT NOT NULL, "
+            "cwd TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', "
+            "label TEXT NOT NULL DEFAULT '', first_seen_at INTEGER NOT NULL, "
+            "last_seen_at INTEGER NOT NULL, injected_count INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "INSERT INTO peers (session_id, tool, first_seen_at, last_seen_at) VALUES ('s','claude',1,1)"
+        )
+        conn.commit()
+        conn.close()
+
+        x2 = load_impl(old)
+        c2 = x2.connect()
+        try:
+            cols = {r["name"] for r in c2.execute("PRAGMA table_info(peers)")}
+            self.assertTrue({"pid", "pid_start", "sock_path", "permission_mode"} <= cols)
+            row = c2.execute("SELECT session_id, pid FROM peers").fetchone()
+            self.assertEqual(row["session_id"], "s", "existing rows must survive the migration")
+            self.assertIsNone(row["pid"])
+        finally:
+            c2.close()
 
 
 class TestFailOpen(unittest.TestCase):

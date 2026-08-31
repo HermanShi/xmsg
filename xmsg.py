@@ -34,7 +34,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
+import socket
 import sqlite3
 import sys
 import time
@@ -111,6 +113,14 @@ CREATE TABLE IF NOT EXISTS peers (
     cwd TEXT NOT NULL DEFAULT '',
     model TEXT NOT NULL DEFAULT '',
     label TEXT NOT NULL DEFAULT '',
+    -- Direct-delivery coordinates, filled in by the receiver's own hook: the
+    -- host process behind this session, when it started (so a recycled pid is
+    -- not mistaken for the same session), the socket it listens on, and the
+    -- permission mode it reported. See "UDS direct delivery" below.
+    pid INTEGER,
+    pid_start INTEGER,
+    sock_path TEXT NOT NULL DEFAULT '',
+    permission_mode TEXT NOT NULL DEFAULT '',
     first_seen_at INTEGER NOT NULL,
     last_seen_at INTEGER NOT NULL,
     injected_count INTEGER NOT NULL DEFAULT 0
@@ -130,6 +140,27 @@ CREATE TABLE IF NOT EXISTS meta (
 # --------------------------------------------------------------------------
 # storage
 # --------------------------------------------------------------------------
+# Columns added to `peers` after the first release. CREATE TABLE IF NOT EXISTS
+# covers a missing table but never a missing column, so these are applied by
+# hand; ALTER TABLE ADD COLUMN is cheap and idempotent once guarded.
+PEER_ADDED_COLUMNS = {
+    "pid": "INTEGER",
+    "pid_start": "INTEGER",
+    "sock_path": "TEXT NOT NULL DEFAULT ''",
+    "permission_mode": "TEXT NOT NULL DEFAULT ''",
+}
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to the current `peers` shape."""
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(peers)")}
+    if not have:
+        return
+    for column, decl in PEER_ADDED_COLUMNS.items():
+        if column not in have:
+            conn.execute(f"ALTER TABLE peers ADD COLUMN {column} {decl}")
+
+
 def connect(*, create: bool = True) -> sqlite3.Connection:
     if create:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -141,6 +172,7 @@ def connect(*, create: bool = True) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=2000")
     if create:
         conn.executescript(SCHEMA)
+        migrate(conn)
     return conn
 
 
@@ -205,6 +237,165 @@ def resolve_target(conn: sqlite3.Connection, spec: str, *, allow_unknown: bool) 
         f"xmsg: no session matches {spec!r}. Run `xmsg list` to see live sessions, "
         f"or pass --force to queue for an unregistered id."
     )
+
+
+# --------------------------------------------------------------------------
+# UDS direct delivery (Claude Code only)
+# --------------------------------------------------------------------------
+# Claude Code's host process listens on a per-pid unix socket and accepts inbound
+# peer messages there. That path does not go through hooks at all: the host reads
+# the line itself and starts a turn to handle it. So unlike hook delivery, it
+# reaches a session that is sitting completely idle -- which is the one window
+# hooks structurally cannot cover, since an idle session runs no hooks.
+#
+# Verified 2026-08-31 on claude-opus-5[1m]: a session parked at its prompt with no
+# turn in flight received a message sent this way and answered it unprompted.
+#
+# This is the host's own channel, not a documented API. Everything below treats it
+# as best-effort: if the socket is gone, the protocol shifts, or the write fails,
+# the message stays queued and the hook path delivers it later. Direct delivery is
+# an accelerator on top of the queue, never a replacement for it.
+#
+# Two properties are load-bearing:
+#   * The kernel tells the receiver our pid (SO_PEERCRED), so we cannot spoof who
+#     we are, and should not try to.
+#   * `from-mode` inside the envelope is a *claim about the sender*. The receiver
+#     holds a message for human review when a bypass-permissions session gets one
+#     from a sender that did not attest its own mode. We fill it in only from what
+#     the sending session actually reported about itself; a sender that reported
+#     nothing sends no claim and its message is held, which is the correct outcome.
+SOCK_DIRS = [
+    Path(f"/run/user/{os.getuid()}/cc-socks"),
+    Path("/tmp/cc-socks"),
+]
+
+# Claude's own parser for the envelope is strict: it re-renders what it parsed and
+# compares, so an attribute carrying an out-of-range character silently voids the
+# whole envelope rather than just that field. These mirror its character classes.
+_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+_LABEL_RE = re.compile(r'^[A-Za-z0-9%:_/.\\-]+$')
+
+# The receiver closes a connection that sends no complete line, so the write has
+# to be a single newline-terminated JSON object and nothing else.
+DIRECT_CONNECT_TIMEOUT = float(os.environ.get("XMSG_DIRECT_TIMEOUT", "1.5"))
+
+
+def sock_path_for(pid: int) -> str:
+    """Where a Claude host with this pid would be listening, if it is."""
+    for d in SOCK_DIRS:
+        candidate = d / f"{pid}.sock"
+        if candidate.exists():
+            return str(candidate)
+    return ""
+
+
+def pid_start_time(pid: int) -> int | None:
+    """Process start time in clock ticks, or None if the pid is gone.
+
+    Paired with the pid this identifies a *process*, not just a slot in the pid
+    table. Without it a recycled pid on a busy machine could take delivery of a
+    message addressed to the session that used to hold it.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # comm can contain spaces and parentheses, so field 22 is counted from the
+    # last ')' rather than by splitting the whole line.
+    tail = stat[stat.rfind(")") + 1 :].split()
+    try:
+        return int(tail[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def envelope(body: str, *, label: str, from_session: str, from_mode: str) -> str:
+    """Build the `<cross-session-message>` element the host expects.
+
+    Attributes are emitted in the host's own order and dropped individually when
+    they would not survive its validation, because a rejected envelope is not a
+    rejected attribute -- it degrades the whole message back to unattributed.
+    """
+    attrs = []
+    if label and _LABEL_RE.match(label):
+        attrs.append(f'from="{label}"')
+    if from_session and _SESSION_RE.match(from_session):
+        attrs.append(f'from-session="{from_session}"')
+    if from_mode in ("bypass", "prompting"):
+        attrs.append(f'from-mode="{from_mode}"')
+    joined = (" " + " ".join(attrs)) if attrs else ""
+    return f"<cross-session-message{joined}>\n{body}\n</cross-session-message>"
+
+
+def claimed_mode(permission_mode: str) -> str:
+    """Map a host-reported permission mode onto the two classes Claude compares.
+
+    Returns "" when the sender reported nothing recognisable. That is not a
+    fallback to a lenient default: an absent claim is what makes the receiver
+    park the message for review, and inventing one here would be forging an
+    attestation on the sender's behalf.
+    """
+    if permission_mode in ("bypassPermissions", "acceptEdits"):
+        return "bypass" if permission_mode == "bypassPermissions" else "prompting"
+    if permission_mode in ("default", "plan", "ask"):
+        return "prompting"
+    return ""
+
+
+def direct_send(
+    row: sqlite3.Row | dict[str, Any],
+    body: str,
+    *,
+    label: str,
+    from_session: str,
+    from_mode: str,
+) -> tuple[bool, str]:
+    """Hand one message straight to a live Claude host. (delivered, detail).
+
+    Never raises: every failure means "leave it queued for the hook path".
+    """
+    pid = row["pid"] if row["pid"] is not None else 0
+    if not pid:
+        return False, "no pid recorded for that session"
+    if pid == os.getpid() or pid == os.getppid():
+        return False, "refusing to deliver to the sending process"
+
+    live_start = pid_start_time(int(pid))
+    if live_start is None:
+        return False, f"pid {pid} is gone"
+    recorded = row["pid_start"]
+    if recorded is not None and int(recorded) != live_start:
+        # Same number, different process: the session that owned it has exited.
+        return False, f"pid {pid} was recycled by another process"
+
+    path = sock_path_for(int(pid)) or str(row["sock_path"] or "")
+    if not path or not Path(path).exists():
+        return False, f"no live socket for pid {pid}"
+
+    payload = {
+        "type": "user",
+        "from": label,
+        "message": {
+            "role": "user",
+            "content": envelope(
+                body, label=label, from_session=from_session, from_mode=from_mode
+            ),
+        },
+    }
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(DIRECT_CONNECT_TIMEOUT)
+        sock.connect(path)
+        sock.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode())
+        # The receiver reads the line asynchronously and answers nothing, so
+        # there is nothing to wait for; shutdown() makes sure the bytes are on
+        # their way before the socket goes away with this process.
+        sock.shutdown(socket.SHUT_WR)
+        return True, path
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    finally:
+        sock.close()
 
 
 # --------------------------------------------------------------------------
@@ -365,8 +556,23 @@ def cmd_send(args: argparse.Namespace) -> int:
                 (t, t + ttl, label, tool, session, target, body),
             )
             ids.append(int(cur.lastrowid or 0))
+
+        # The row is written first, then we try to push it straight at the
+        # receiver. Order matters: if this process dies mid-delivery the message
+        # is still queued and the hook path picks it up, whereas delivering
+        # before persisting could drop it entirely. Direct delivery marks the row
+        # delivered only after the bytes are away.
+        direct = {} if args.no_direct else direct_deliver(conn, ids, targets, body, label, session)
+
         for mid, target in zip(ids, targets):
-            print(f"queued #{mid} -> {target}  (from {label}, ttl {ttl}s)")
+            outcome = direct.get(mid)
+            if outcome is None:
+                where = "queued" if args.no_direct else "queued (hook delivery)"
+                print(f"{where} #{mid} -> {target}  (from {label}, ttl {ttl}s)")
+            elif outcome[0]:
+                print(f"delivered #{mid} -> {target}  (from {label}, direct to idle session)")
+            else:
+                print(f"queued #{mid} -> {target}  (from {label}, ttl {ttl}s; direct: {outcome[1]})")
         if not session:
             # Said at send time, not only at the receiver: an agent that meant to
             # identify itself and forgot the env vars would otherwise never find
@@ -380,6 +586,75 @@ def cmd_send(args: argparse.Namespace) -> int:
     finally:
         conn.close()
     return 0
+
+
+def direct_deliver(
+    conn: sqlite3.Connection,
+    ids: list[int],
+    targets: list[str],
+    body: str,
+    label: str,
+    from_session: str,
+) -> dict[int, tuple[bool, str]]:
+    """Try to hand each freshly queued message to its receiver right now.
+
+    Returns {message id: (delivered, detail)} for the ones we had coordinates
+    for; ids absent from the result had no live host to try. A row is marked
+    delivered here only on success, so anything this fails to place stays queued
+    and reaches the receiver through the hook path instead -- the two paths share
+    the same at-most-once claim, so a message never lands twice.
+    """
+    out: dict[int, tuple[bool, str]] = {}
+    for mid, target in zip(ids, targets):
+        row = conn.execute(
+            "SELECT pid, pid_start, sock_path, tool, permission_mode FROM peers WHERE session_id = ?",
+            (target,),
+        ).fetchone()
+        if row is None:
+            continue
+        if row["tool"] and row["tool"] != "claude":
+            # Only Claude Code exposes this socket. Codex sessions keep using the
+            # hook path, which is why the queue stays the primary mechanism.
+            out[mid] = (False, f"{row['tool']} has no inbound socket")
+            continue
+
+        mode = sender_claimed_mode(conn, from_session)
+        ok, detail = direct_send(
+            row, body, label=label, from_session=from_session, from_mode=mode
+        )
+        if ok:
+            # Claim it the same way the hook does, so the hook cannot deliver it
+            # a second time. Losing this race (a hook claimed it while we were
+            # writing) is harmless: the receiver gets it exactly once either way.
+            cur = conn.execute(
+                "UPDATE messages SET delivered_at = ?, delivered_tool = 'claude', "
+                "delivered_event = 'uds-direct' WHERE id = ? AND delivered_at IS NULL "
+                "AND expired_at IS NULL",
+                (now(), mid),
+            )
+            if not cur.rowcount:
+                detail = f"{detail} (already claimed by a hook)"
+        out[mid] = (ok, detail)
+    return out
+
+
+def sender_claimed_mode(conn: sqlite3.Connection, from_session: str) -> str:
+    """The sending session's own permission class, as it last reported it.
+
+    Read from the sender's peer row rather than from this process: `xmsg send`
+    runs as a child of the sending session, and the mode is a property of that
+    session, not of the shell. A sender with no row -- a human at a terminal, a
+    cron job -- claims nothing, and the receiver will park the message for review
+    instead of acting on it. That is the intended outcome, not a gap to close.
+    """
+    if not from_session:
+        return ""
+    row = conn.execute(
+        "SELECT permission_mode FROM peers WHERE session_id = ?", (from_session,)
+    ).fetchone()
+    if row is None:
+        return ""
+    return claimed_mode(str(row["permission_mode"] or ""))
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -399,15 +674,41 @@ def cmd_list(args: argparse.Namespace) -> int:
         if not rows:
             print("no sessions registered yet (a session registers on its first tool call)")
             return 0
-        print(f"{'SESSION':<38} {'TOOL':<7} {'SEEN':>5} {'Q':>3}  CWD")
+        print(f"{'SESSION':<38} {'TOOL':<7} {'SEEN':>5} {'Q':>3} {'DIRECT':<6}  CWD")
         for r in rows:
+            # "direct" answers a question the other columns cannot: whether a
+            # message sent now would reach this session while it sits idle, or
+            # only once it runs a tool again.
+            direct = "yes" if reachable_now(r) else "-"
             print(
                 f"{r['session_id']:<38} {r['tool']:<7} {ago(r['last_seen_at']):>5} "
-                f"{r['queued']:>3}  {r['cwd']}"
+                f"{r['queued']:>3} {direct:<6}  {r['cwd']}"
             )
     finally:
         conn.close()
     return 0
+
+
+def reachable_now(row: sqlite3.Row | dict[str, Any]) -> bool:
+    """Whether direct delivery would find a live host for this peer right now.
+
+    Deliberately re-derives the socket from the live pid instead of trusting the
+    recorded path: a stale row and an exited process look identical otherwise,
+    and a socket file outlives its owner.
+    """
+    try:
+        pid = row["pid"]
+        tool = row["tool"]
+    except (KeyError, IndexError):
+        return False
+    if tool != "claude" or not pid:
+        return False
+    if pid_start_time(int(pid)) is None:
+        return False
+    recorded = row["pid_start"] if "pid_start" in row.keys() else None
+    if recorded is not None and int(recorded) != pid_start_time(int(pid)):
+        return False
+    return bool(sock_path_for(int(pid)))
 
 
 def cmd_outbox(args: argparse.Namespace) -> int:
@@ -494,18 +795,62 @@ def claim(conn: sqlite3.Connection, session_id: str, tool: str, event: str) -> l
     return rows
 
 
+def host_pid() -> int:
+    """The agent host process this hook is running under.
+
+    Walked rather than taken from getppid(): the hook runs as
+    `sh -c` under the host, so the immediate parent is a shell. Stops at the
+    first ancestor whose name matches a known host binary.
+    """
+    hosts = {"claude", "claude.exe", "codex", "codex.exe"}
+    pid = os.getppid()
+    for _ in range(12):
+        if pid <= 1:
+            return 0
+        try:
+            comm = Path(f"/proc/{pid}/comm").read_text().strip()
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return 0
+        if comm in hosts:
+            return pid
+        tail = stat[stat.rfind(")") + 1 :].split()
+        try:
+            pid = int(tail[1])
+        except (IndexError, ValueError):
+            return 0
+    return 0
+
+
 def _register_peer(conn: sqlite3.Connection, payload: dict[str, Any], tool: str, delivered: int) -> None:
+    """Record this session as a delivery target, with its direct-delivery coordinates.
+
+    Beyond keeping the session addressable, this is where the socket path, the
+    owning pid (plus its start time, so a recycled pid cannot inherit someone
+    else's mail) and the session's own permission mode get captured. All three
+    come from the receiver describing itself; a sender never supplies them.
+    """
     session_id = str(payload.get("session_id") or "")
     if not session_id:
         return
     t = now()
+    pid = host_pid()
+    start = pid_start_time(pid) if pid else None
+    sock = sock_path_for(pid) if pid else ""
+    mode = str(payload.get("permission_mode") or "")
     conn.execute(
-        "INSERT INTO peers (session_id, tool, cwd, model, label, first_seen_at, last_seen_at, injected_count) "
-        "VALUES (?,?,?,?,?,?,?,?) "
+        "INSERT INTO peers (session_id, tool, cwd, model, label, pid, pid_start, sock_path, "
+        "permission_mode, first_seen_at, last_seen_at, injected_count) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
         "ON CONFLICT(session_id) DO UPDATE SET "
         "  tool = excluded.tool,"
         "  cwd = CASE WHEN excluded.cwd <> '' THEN excluded.cwd ELSE peers.cwd END,"
         "  model = CASE WHEN excluded.model <> '' THEN excluded.model ELSE peers.model END,"
+        "  pid = CASE WHEN excluded.pid IS NOT NULL THEN excluded.pid ELSE peers.pid END,"
+        "  pid_start = CASE WHEN excluded.pid_start IS NOT NULL THEN excluded.pid_start ELSE peers.pid_start END,"
+        "  sock_path = CASE WHEN excluded.sock_path <> '' THEN excluded.sock_path ELSE peers.sock_path END,"
+        "  permission_mode = CASE WHEN excluded.permission_mode <> '' "
+        "                         THEN excluded.permission_mode ELSE peers.permission_mode END,"
         "  last_seen_at = excluded.last_seen_at,"
         "  injected_count = peers.injected_count + ?",
         (
@@ -514,6 +859,10 @@ def _register_peer(conn: sqlite3.Connection, payload: dict[str, Any], tool: str,
             str(payload.get("cwd") or ""),
             str(payload.get("model") or ""),
             "",
+            pid or None,
+            start,
+            sock,
+            mode,
             t,
             t,
             delivered,
@@ -650,6 +999,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"peer stale  {PEER_STALE_SECONDS}s")
     print(f"retain      {RETAIN_DELIVERED_SECONDS}s delivered / {RETAIN_PEER_SECONDS}s peers")
     print(f"python3     {shutil.which('python3')}")
+    socks = [str(d) for d in SOCK_DIRS if d.is_dir()]
+    print(f"sock dirs   {', '.join(socks) if socks else 'none found (direct delivery unavailable)'}")
     conn = connect()
     try:
         size_before = DB_PATH.stat().st_size if DB_PATH.exists() else 0
@@ -668,7 +1019,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         ).fetchone()["c"]
         free = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
         row = conn.execute("SELECT value FROM meta WHERE key = 'last_sweep_at'").fetchone()
-        print(f"peers       {live} live / {peers} known")
+        reachable = sum(
+            1
+            for r in conn.execute(
+                "SELECT pid, pid_start, tool FROM peers WHERE last_seen_at >= ?",
+                (now() - PEER_STALE_SECONDS,),
+            )
+            if reachable_now(r)
+        )
+        print(f"peers       {live} live / {peers} known ({reachable} reachable by direct delivery)")
         print(f"queued      {queued}")
         print(f"retained    {kept} finished row(s) awaiting deletion")
         size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
@@ -696,6 +1055,11 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--from", dest="from_label", default="", help="override the sender label")
     s.add_argument("--ttl", type=int, default=None, help=f"seconds before giving up (default {DEFAULT_TTL_SECONDS})")
     s.add_argument("--force", action="store_true", help="allow an unregistered session id")
+    s.add_argument(
+        "--no-direct",
+        action="store_true",
+        help="skip direct delivery; queue for the receiver's next hook instead",
+    )
     s.set_defaults(fn=cmd_send)
 
     s = sub.add_parser("list", help="list sessions available as delivery targets")
