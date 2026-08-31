@@ -738,9 +738,20 @@ class TestDirectDeliveryTargeting(DirectBase):
         self.assertFalse(ok)
         self.assertIn("no live socket", detail)
 
-    def test_codex_peer_is_left_to_the_hook_path(self) -> None:
-        # Only Claude Code exposes this socket; a Codex session is addressed the
-        # same way but reached only by its hooks.
+    def test_codex_peer_goes_through_codex_queue(self) -> None:
+        # Codex has no socket but does have `codex queue`, so it gets a direct
+        # path of its own. Here the binary is a stub that records its argv.
+        stub = self.tmp / "codex-stub"
+        log = self.tmp / "argv.json"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"open({str(log)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+        )
+        stub.chmod(0o755)
+        os.environ["XMSG_CODEX_BIN"] = str(stub)
+        self.addCleanup(os.environ.pop, "XMSG_CODEX_BIN", None)
+
         conn = self.x.connect()
         try:
             pid = self.spawn_target()
@@ -750,19 +761,76 @@ class TestDirectDeliveryTargeting(DirectBase):
                 (pid, self.x.pid_start_time(pid), self.x.now(), self.x.now()),
             )
             mid = self.queue("hi", to="sess-codex")
-            out = self.x.direct_deliver(conn, [mid], ["sess-codex"], "hi", "p", "sess-a")
-            self.assertFalse(out[mid][0])
-            self.assertIn("no inbound socket", out[mid][1])
-            row = conn.execute("SELECT delivered_at FROM messages WHERE id = ?", (mid,)).fetchone()
-            self.assertIsNone(row["delivered_at"], "a refused direct send must leave the row queued")
+            out = self.x.direct_deliver(conn, [mid], ["sess-codex"], "hi", "p", "claude", "sess-a")
+            self.assertTrue(out[mid][0], out[mid][1])
+
+            argv = json.loads(log.read_text())
+            self.assertEqual(argv[0], "queue")
+            self.assertEqual(argv[argv.index("--thread") + 1], "sess-codex")
+            sent = argv[argv.index("--message") + 1]
+            # Codex shows this as user input, so the peer framing has to be in the
+            # text itself -- otherwise the receiver reads it as its user speaking.
+            self.assertIn("NOT instructions from your user", sent)
+            self.assertIn("hi", sent)
+
+            row = conn.execute(
+                "SELECT delivered_tool, delivered_event FROM messages WHERE id = ?", (mid,)
+            ).fetchone()
+            self.assertEqual(row["delivered_tool"], "codex")
+            self.assertEqual(row["delivered_event"], "codex-queue")
         finally:
             conn.close()
+
+    def test_codex_queue_failure_leaves_the_row_queued(self) -> None:
+        # A dead session still has a rollout on disk, so `codex queue` would file
+        # the message for a future resume and exit 0. That is not delivery, so the
+        # liveness check has to run before it -- otherwise the row gets marked
+        # delivered and the message is silently lost.
+        stub = self.tmp / "codex-fail"
+        stub.write_text("#!/bin/sh\necho 'no rollout found' >&2\nexit 1\n")
+        stub.chmod(0o755)
+        os.environ["XMSG_CODEX_BIN"] = str(stub)
+        self.addCleanup(os.environ.pop, "XMSG_CODEX_BIN", None)
+
+        conn = self.x.connect()
+        try:
+            pid = self.spawn_target()
+            conn.execute(
+                "INSERT INTO peers (session_id, tool, pid, pid_start, first_seen_at, last_seen_at) "
+                "VALUES ('sess-cx2','codex',?,?,?,?)",
+                (pid, self.x.pid_start_time(pid), self.x.now(), self.x.now()),
+            )
+            mid = self.queue("hi", to="sess-cx2")
+            out = self.x.direct_deliver(conn, [mid], ["sess-cx2"], "hi", "p", "claude", "sess-a")
+            self.assertFalse(out[mid][0])
+            self.assertIn("no rollout", out[mid][1])
+            row = conn.execute("SELECT delivered_at FROM messages WHERE id = ?", (mid,)).fetchone()
+            self.assertIsNone(row["delivered_at"])
+        finally:
+            conn.close()
+
+    def test_dead_codex_session_is_refused_before_codex_runs(self) -> None:
+        # The guard has to fire without invoking codex at all: a stub that would
+        # succeed must never be reached for a session whose process is gone.
+        stub = self.tmp / "codex-never"
+        marker = self.tmp / "ran"
+        stub.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
+        stub.chmod(0o755)
+        os.environ["XMSG_CODEX_BIN"] = str(stub)
+        self.addCleanup(os.environ.pop, "XMSG_CODEX_BIN", None)
+
+        ok, detail = self.x.direct_send_codex(
+            {"pid": 4194303, "pid_start": 1}, "hi", to_session="sess-gone"
+        )
+        self.assertFalse(ok)
+        self.assertIn("gone", detail)
+        self.assertFalse(marker.exists(), "codex must not be invoked for a dead session")
 
     def test_unknown_peer_is_skipped_without_a_verdict(self) -> None:
         conn = self.x.connect()
         try:
             mid = self.queue("hi", to="sess-nowhere")
-            out = self.x.direct_deliver(conn, [mid], ["sess-nowhere"], "hi", "p", "sess-a")
+            out = self.x.direct_deliver(conn, [mid], ["sess-nowhere"], "hi", "p", "claude", "sess-a")
             self.assertNotIn(mid, out)
         finally:
             conn.close()
@@ -842,7 +910,9 @@ class TestDirectDeliveryOverSocket(DirectBase):
                  self.x.now(), self.x.now()),
             )
             mid = self.queue("hi there", to="sess-live")
-            out = self.x.direct_deliver(conn, [mid], ["sess-live"], "hi there", "peer-a", "sess-a")
+            out = self.x.direct_deliver(
+                conn, [mid], ["sess-live"], "hi there", "peer-a", "claude", "sess-a"
+            )
             th.join(timeout=5)
             self.assertTrue(out[mid][0], out[mid][1])
             row = conn.execute(
@@ -895,12 +965,23 @@ class TestPeerDirectColumns(Base):
         finally:
             conn.close()
 
-    def test_reachable_now_needs_a_live_claude_host(self) -> None:
+    def test_reachable_now_needs_a_live_host(self) -> None:
+        # No pid recorded, a dead pid, and an unknown tool are all unreachable.
         self.assertFalse(self.x.reachable_now({"pid": None, "tool": "claude", "pid_start": None}))
-        self.assertFalse(self.x.reachable_now({"pid": os.getpid(), "tool": "codex", "pid_start": None}))
+        self.assertFalse(self.x.reachable_now({"pid": 4194303, "tool": "claude", "pid_start": 1}))
         self.assertFalse(
-            self.x.reachable_now({"pid": 4194303, "tool": "claude", "pid_start": 1})
+            self.x.reachable_now({"pid": os.getpid(), "tool": "cursor", "pid_start": None})
         )
+
+    def test_reachable_now_for_codex_needs_only_a_live_process(self) -> None:
+        # Codex is addressed by session id rather than by socket, so a live process
+        # plus a codex binary is all that can be checked from here.
+        os.environ["XMSG_CODEX_BIN"] = "/bin/sh"
+        self.addCleanup(os.environ.pop, "XMSG_CODEX_BIN", None)
+        self.assertTrue(
+            self.x.reachable_now({"pid": os.getpid(), "tool": "codex", "pid_start": None})
+        )
+        self.assertFalse(self.x.reachable_now({"pid": 4194303, "tool": "codex", "pid_start": 1}))
 
     def test_migration_adds_columns_to_an_older_database(self) -> None:
         # A database created before direct delivery existed must gain the columns

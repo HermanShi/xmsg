@@ -23,15 +23,18 @@ B 这一轮要收尾:  Stop hook 触发 → 取出消息 → decision:block + re
 
 | 窗口 | 触发时机 | 机制 | 模型怎么看到 |
 | --- | --- | --- | --- |
-| `uds-direct` | 随时，包括对方 idle | 直连 host 的 unix socket | host 自己起一轮来处理 |
+| `uds-direct` | 随时，包括对方 idle | 直连 Claude host 的 unix socket | host 自己起一轮来处理 |
+| `codex-queue` | 随时，包括对方 idle | 官方 `codex queue` 命令 | 渲染成用户输入，起一轮处理 |
 | `PreToolUse` | 一轮正在跑，即将调工具 | hook | 拼进那次工具调用前的上下文 |
 | `Stop` | 一轮正要收尾、转 idle | hook | 带着消息重启这一轮 |
+
+前两个按对方是 Claude 还是 Codex 二选一，都能触达 idle 会话；后两个是 hook，两边通用。
 
 `xmsg send` 先写库，再尝试直投；直投成功就地标记已投递，失败则原样留在队列里等
 hook。**顺序是刻意的**：先落库保证进程半路死掉也不丢消息，而先投再落库可能两头空。
 两条路共用同一个 at-most-once 领取，所以不会重复送达。
 
-### uds-direct：唯一能触达 idle 会话的窗口
+### uds-direct：Claude 侧触达 idle 会话的窗口
 
 Claude Code 的 host 进程在 `/run/user/<uid>/cc-socks/<pid>.sock` 上监听，并直接接受
 inbound peer 消息。**这条路完全不经过 hook** —— host 自己读走那一行，然后主动起一个
@@ -39,6 +42,8 @@ turn 去处理。所以它能触达一个正停在提示符上、没有任何 tu
 
 2026-08-31 实测（claude-opus-5[1m]）：一个 idle 了 31 秒的会话收到消息后自己起了一轮，
 零人工确认，并原样报出了探针码。
+
+（Codex 侧的对应窗口走官方 `codex queue` 命令，机制和坑都不同，见「工具支持边界」。）
 
 **这是 host 自己的通道，不是公开 API**，所以实现全程按 best-effort 对待：socket 没了、
 协议变了、写失败了，消息就留在队列里由 hook 投。直投只是队列之上的加速器，
@@ -99,7 +104,8 @@ turn 去处理。所以它能触达一个正停在提示符上、没有任何 tu
 不代表 host 本身受这个限制 —— host 就是靠 UDS 绕开了它。结论只在 hook 这一层成立，
 把它推广到整个 host 是我判错了一次。见上面的 uds-direct。
 
-对 Codex 而言这条限制仍然完整成立（没有那个 socket），所以投递要趁对方还活着。
+⚠️ 「Codex 没有 socket 所以只能靠 hook」这条也已被推翻：它没有 socket，
+但有官方的 `codex queue`，一样能推进 idle 会话。见「工具支持边界」那节。
 
 ## 安装
 
@@ -337,7 +343,9 @@ label 伪造不了 session）、清理 9 例（保留窗口内外、只收不发
 | `XMSG_MAX_PER_INJECT` | 10 | 单次注入条数上限 |
 | `XMSG_MAX_BODY_CHARS` | 8000 | 单条正文上限 |
 | `XMSG_HOOK_TIMEOUT` | 3 | hook 自我切断时限（秒） |
-| `XMSG_DIRECT_TIMEOUT` | 1.5 | 直投连接/写入超时（秒），超时即回落队列 |
+| `XMSG_DIRECT_TIMEOUT` | 1.5 | Claude 直投连接/写入超时（秒），超时即回落队列 |
+| `XMSG_CODEX_TIMEOUT` | 20 | `codex queue` 超时（秒），超时即回落队列 |
+| `XMSG_CODEX_BIN` | `which codex` | codex 可执行文件路径，测试用桩 |
 | `XMSG_RETAIN_SECONDS` | 1209600 | 已投递行保留多久（14 天），之后删行 |
 | `XMSG_RETAIN_PEER_SECONDS` | 2592000 | peers 记录保留多久（30 天） |
 | `XMSG_HOOK_SWEEP_INTERVAL` | 3600 | hook 路径最短清理间隔（秒） |
@@ -405,10 +413,41 @@ label 伪造不了 session）、清理 9 例（保留窗口内外、只收不发
 
 | 工具 | 可用投递窗口 | 状态 |
 | --- | --- | --- |
-| Claude Code | `PreToolUse` + `Stop` | 已接，两者均实测通过 |
-| Codex CLI 0.150.1 | `PreToolUse` + `Stop` | 两者均实测通过。`Stop` 与 Claude 完全同构：payload 带 `stop_hook_active`/`last_assistant_message`，`decision:block` 被采纳（日志打 `hook: Stop Blocked`）。⚠️ 新增 hook 条目需一次交互式信任确认，见下 |
+| Claude Code | `uds-direct` + `PreToolUse` + `Stop` | 三者均实测通过。直投走 host 的 unix socket，能触达 idle 会话 |
+| Codex CLI 0.151.0 | `codex queue` + `PreToolUse` + `Stop` | 三者均实测通过。直投走官方 `codex queue`（不是逆向的），同样能触达 idle 会话，见下。`Stop` 与 Claude 完全同构：payload 带 `stop_hook_active`/`last_assistant_message`，`decision:block` 被采纳（日志打 `hook: Stop Blocked`）。⚠️ 新增 hook 条目需一次交互式信任确认，见下 |
 | Cursor Agent | 无 | 只有 `sessionStart` 能注入；`beforeSubmitPrompt` 的 output 只支持 `continue`/`user_message`，官方文档明确不支持 context 注入。要接只能降级成开会话时投一次。 |
 | Antigravity / Gemini | 未知 | 本机没装，没有实测依据，故未实现。 |
+
+### Codex 的直投：官方命令，但有两个必须处理的差异
+
+Codex 没有 inbound socket，但它提供了一个**官方支持的命令**：
+
+```bash
+codex queue --thread <session-id> --message "<text>"
+```
+
+2026-08-31 实测（0.151.0）：一个 idle 的会话自己把消息取走并回答了。
+比 Claude 那条路干净——是公开命令，不是逆向出来的内部端点。
+
+两个差异改变了实现：
+
+**1. 消息被渲染成用户输入，没有 peer 框架也没有 hold 闸门。**
+Claude 那边 host 会把消息包成 `<cross-session-message>` 并加上「这不是你的用户在说话」
+的框架；Codex 这边它直接显示成 `› 通报：…`，跟用户亲手敲的没有区别。
+所以**框架必须由 xmsg 写进正文**——这条直投路径复用 `render()` 而不是发裸正文。
+相应地，Claude 那道「bypass 模式收到未声明来源的消息就 hold 住等人确认」的闸门，
+在 Codex 侧不存在，`from-mode` 在这边没有对应物。
+
+**2. 它需要磁盘上有 rollout，而「排进去了」不等于「送到了」。**
+一个还没跑完任何一轮的会话会被拒（`no rollout found`），这种只能走 hook。
+更要紧的是反面情况：**会话已经退出但 rollout 还在时，`codex queue` 会成功并 exit 0**，
+把消息存起来等将来有人 resume 那个 thread。那不是投递。
+所以活跃性检查（pid + 启动时刻）必须跑在调用 codex **之前** ——
+只看退出码就标记已投递，会让消息悄悄丢掉。有一条测试专门钉这个：
+桩程序设成必然成功，然后断言它对死会话**根本没被调用**。
+
+顺带一个观察：`~/.codex/thread-writer-locks/<id>.lock` 在进程退出后仍留着且未被持有，
+所以**锁文件不能当活跃判据**，仍然要靠 pid + 启动时刻。
 
 ### Codex 的 hook 信任门槛（栽过两次的坑）
 
