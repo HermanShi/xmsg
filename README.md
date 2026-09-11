@@ -527,6 +527,67 @@ rollout 只记已进入对话的内容。拿 rollout 当判据会得出「投递
 **顺带：两条路都发了怎么办。** ①的队列消息撤回用 `xmsg cancel <id>`，
 不然万一将来 Codex 侧装上了 xmsg hook，它会在 TTL 内把那条陈旧消息领走一次。
 
+### 同一条消息发两次的两种走法（实测踩过，两次都是我的错）
+
+上面那节说的是「怎么发到」。这节说的是**发到了但对方找不到**，以及**修它的时候
+怎么又发重了**。同一天连撞两次，形状不同。
+
+**坑一：`codex queue` 发的消息，对方在 `xmsg outbox` 里看不到。**
+
+两套是**不同的库**：
+
+| 发送方式 | 消息落在 |
+| --- | --- |
+| `codex queue --thread …` | `~/.codex/queue_1.sqlite` 的 `queued_items` |
+| `xmsg send …` | `~/.local/share/agent-msg/messages.sqlite3` |
+
+我用 `codex queue` 发了两条重要消息，对方去 `xmsg` 那侧找 —— 只看到一条无关的
+探针和一条 `EXPIRED undelivered after 7200s` 的（那正是上一节说的「`--force` 扔黑洞」，
+它真的黑洞了）。**两条真消息在它的视野里根本不存在。**
+
+⇒ 判据：**收件方用哪个工具找，就用那个工具发。** 想让消息在 `xmsg outbox` 里可追踪，
+就走 `xmsg send`；直接敲 `codex queue` 等于绕过 xmsg 的账本。
+
+**坑二：修坑一的时候，同一条消息投了两份。**
+
+发现对方找不到，我用 `xmsg send` 重发了一次，结果：
+
+```
+delivered #30 -> 01a0908d…  (from leader, direct to idle session)
+```
+
+看着完美 —— `delivered` 不是 `queued`，还带了署名。**但 `queued_items` 变成了 3 行。**
+
+因为 `xmsg` 对 codex peer 走的正是 `direct_send_codex`（`xmsg.py:432`），底层**调的
+就是 `codex queue`** —— 它和我手工发的那两条进了同一个队列。对方下一轮会一次收到
+三份，其中两份是同一条消息。
+
+⇒ 两条判据：
+
+1. **`xmsg send` 到 codex 不是另一条通道，是同一条通道的封装。** 「已经用
+   `codex queue` 发过、再用 `xmsg` 重发」必然投两份。
+2. ⚠️ **`xmsg outbox` 只显示 xmsg 自己那一份**，手工 `codex queue` 发的那些它看不见 ——
+   两个来源在收件侧无法区分，在发件侧也无法在一个地方看全。**要数「对方将收到几份」，
+   判据是 `queued_items` 的行数**，不是 `xmsg outbox`。
+3. `xmsg cancel` 只能撤 xmsg 自己库里的，**撤不了手工 `codex queue` 排进去的**（那个
+   队列没有撤回命令）。所以重复一旦造成，只能在消息正文里说清哪条有效。
+
+**还有一个更早就该发现的变体**：上一节说「判『对方开始干了』看 `queued_items` 那行消失」，
+这话不完整 —— 归零只能证明**某条**被领了，**不能证明「我最后发的那条」被领了**。
+我就是看到 `queued_items: 0` 就宣布消息已送达，而那个 0 是**上一条**被领走后的空队列，
+我那条是在那之后才排进去的。⇒ **比对 `id`，不是数行数。**
+
+**发送方自报身份别忘了。** 手工 `codex queue` 没有署名机制；`xmsg send` 不设
+`XMSG_FROM_SESSION` 时消息被标成 `unattributed`，而那个标记的语义是「告诉接收方
+别单独据此行动」。给下级派活或向上级请示时带着这个标记，语气就错了。正确形态：
+
+```bash
+XMSG_FROM_TOOL=claude XMSG_FROM_SESSION=<自己的 session id> \
+  xmsg send <target> --from leader < brief.md
+```
+
+自己的 session id 可以从 `peers` 表按自己的 pid 反查（Claude 侧 pid 就是 `$PPID`）。
+
 ### Codex 的 hook 信任门槛（栽过两次的坑）
 
 Codex 把每个 hook 条目的哈希记在 `~/.codex/config.toml` 的
