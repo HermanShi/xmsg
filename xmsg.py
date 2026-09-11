@@ -1067,6 +1067,44 @@ def cmd_queue(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_find(args: argparse.Namespace) -> int:
+    """Resolve one session id/name for shell scripts."""
+    conn = connect()
+    try:
+        discovered = discover_sessions(conn)
+        if args.query:
+            # resolve_target enforces the documented order and ambiguity guard;
+            # use the resulting ids to return the richer discovery records.
+            ids = resolve_target(conn, args.query, allow_unknown=False)
+            rows = [row for row in discovered if row["session_id"] in ids]
+        else:
+            rows = discovered
+            rows.sort(
+                key=lambda row: int(row.get("last_seen_at") or row.get("updated_at") or 0),
+                reverse=True,
+            )
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+            return 0
+        if not rows:
+            raise SystemExit(f"xmsg: no session matches {args.query!r}") if args.query else SystemExit(
+                "xmsg: no discovered sessions"
+            )
+        if args.ids_only:
+            for row in rows:
+                print(row["session_id"])
+            return 0
+        print(f"{'NAME':<24} {'SESSION':<38} {'TOOL':<7} SOURCE")
+        for row in rows:
+            print(
+                f"{session_name(row)[:24]:<24} {row['session_id']:<38} "
+                f"{row.get('tool', '-'):<7} {row.get('source', '-')}"
+            )
+    finally:
+        conn.close()
+    return 0
+
+
 def reachable_now(row: sqlite3.Row | dict[str, Any]) -> bool:
     """Whether direct delivery would find a live host for this peer right now.
 
@@ -1477,6 +1515,12 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--limit", type=int, default=50)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_queue)
+
+    s = sub.add_parser("find", help="find sessions by custom name or id")
+    s.add_argument("query", nargs="?", default="", help="exact session id, custom name, or id prefix")
+    s.add_argument("--ids-only", action="store_true", help="print only complete session ids")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_find)
 
     s = sub.add_parser("list", help="list sessions available as delivery targets")
     s.add_argument("--all", action="store_true", help="include sessions that have gone quiet")

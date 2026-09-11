@@ -23,6 +23,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 IMPL = HERE.parent / "xmsg.py"
 HOOK_SH = HERE.parent / "xmsg-hook.sh"
+FIND_SH = HERE.parent / "bin" / "xmsg-find-session"
 
 
 def load_impl(db_path: Path):
@@ -1299,6 +1300,41 @@ class TestCli(unittest.TestCase):
         r = self.cli("send", "sess-cli-7", "-", stdin="NONCE-CLI-STDIN from a pipe")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("NONCE-CLI-STDIN", self.hook_once("sess-cli-7").stdout)
+
+    def test_find_session_script_prints_complete_id_for_custom_name(self) -> None:
+        projects = self.tmp / "claude-projects"
+        session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        title = projects / "project" / session_id / "custom-title.json"
+        title.parent.mkdir(parents=True)
+        title.write_text('{"customTitle":"named-target"}')
+        env = dict(self.env, XMSG_CLAUDE_PROJECTS=str(projects))
+        found = subprocess.run(
+            [str(FIND_SH), "named-target"], capture_output=True, text=True, env=env
+        )
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertEqual(found.stdout.strip(), session_id)
+
+        detailed = subprocess.run(
+            [str(FIND_SH), "named-target", "--json"], capture_output=True, text=True, env=env
+        )
+        self.assertEqual(detailed.returncode, 0, detailed.stderr)
+        self.assertEqual(json.loads(detailed.stdout)[0]["name"], "named-target")
+
+    def test_find_session_script_refuses_ambiguous_custom_name(self) -> None:
+        projects = self.tmp / "claude-projects"
+        for session_id in (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        ):
+            title = projects / "project" / session_id / "custom-title.json"
+            title.parent.mkdir(parents=True)
+            title.write_text('{"customTitle":"same-name"}')
+        env = dict(self.env, XMSG_CLAUDE_PROJECTS=str(projects))
+        found = subprocess.run(
+            [str(FIND_SH), "same-name"], capture_output=True, text=True, env=env
+        )
+        self.assertNotEqual(found.returncode, 0)
+        self.assertIn("matches 2 sessions", found.stderr)
 
 
 if __name__ == "__main__":

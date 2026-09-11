@@ -146,6 +146,8 @@ xmsg list --all                    # 连已经安静下来的一起列
                                    # DIRECT=yes 表示现在直投就能触达（哪怕对方 idle）
 xmsg queue                        # 同时查看 xmsg hook 队列和 Codex 官方下一轮队列
 xmsg queue --name leader          # 按自定义会话名筛选（重名会列候选，不会误投）
+xmsg-find-session leader           # 只输出自定义会话名对应的完整 session id
+xmsg-find-session leader --json    # 输出完整发现记录
 
 xmsg send 01a04cbe "把 #163 的结论同步给我"     # 全 id 或 >=4 字符的唯一前缀
 xmsg send leader "请优先看这个"                 # 自定义名；完整 session id 优先
@@ -172,6 +174,10 @@ xmsg doctor                        # 配置与队列健康
 `next-turn`。Codex 官方队列没有优先级参数，也不会被 `--urgent` 改写；要把文字追加到
 Codex **当前进行中的 turn**，官方交互快捷键是 Enter（steer），Tab 才是 queue（下一轮）。
 脚本只能可靠调用 `codex queue`，因此输出和文档都明确写“下一轮”，不把排队误报为插话。
+
+如果脚本或人工操作只需要完整 session id，可以使用独立的
+`xmsg-find-session <自定义名>`。它复用同一套发现和解析规则：完整 id 优先、其次精确
+自定义名，再其次 id 前缀；重名会列出候选并以非零状态退出，不会猜一个发送。
 
 `send` 的输出会说清走了哪条路：
 

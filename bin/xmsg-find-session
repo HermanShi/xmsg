@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Resolve a Codex/Claude session by its custom name and print its complete id.
+#
+# Examples:
+#   xmsg-find-session leader
+#   xmsg-find-session leader --json
+#
+# The discovery and ambiguity rules live in xmsg.py; this file is only a
+# convenient script entry point for shell hooks and other automation.
+set -euo pipefail
+
+if [[ $# -eq 0 ]]; then
+  printf 'usage: xmsg-find-session <session-id-or-custom-name> [--json]\n' >&2
+  exit 2
+fi
+
+if [[ "${2:-}" == "--json" ]]; then
+  exec /usr/bin/python3 "${XMSG_IMPL:-$HOME/agent-msg/xmsg.py}" find "$1" --json
+fi
+
+if [[ $# -ne 1 ]]; then
+  printf 'usage: xmsg-find-session <session-id-or-custom-name> [--json]\n' >&2
+  exit 2
+fi
+
+exec /usr/bin/python3 "${XMSG_IMPL:-$HOME/agent-msg/xmsg.py}" find "$1" --ids-only
