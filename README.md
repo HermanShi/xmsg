@@ -144,8 +144,12 @@ mirror 一次、并且可从 Markdown 重建，而消息行两个性质都不具
 xmsg list                          # 哪些会话现在能收（类似 ListAgents）
 xmsg list --all                    # 连已经安静下来的一起列
                                    # DIRECT=yes 表示现在直投就能触达（哪怕对方 idle）
+xmsg queue                        # 同时查看 xmsg hook 队列和 Codex 官方下一轮队列
+xmsg queue --name leader          # 按自定义会话名筛选（重名会列候选，不会误投）
 
 xmsg send 01a04cbe "把 #163 的结论同步给我"     # 全 id 或 >=4 字符的唯一前缀
+xmsg send leader "请优先看这个"                 # 自定义名；完整 session id 优先
+xmsg send leader "紧急提醒" --urgent            # 仅提高 xmsg hook 队列优先级
 xmsg send all "所有人停一下"                     # 广播给所有活跃会话
 echo "长内容" | xmsg send 01a04cbe -            # 从 stdin 读正文
 
@@ -159,7 +163,15 @@ xmsg doctor                        # 配置与队列健康
 
 会话 id 从哪来：`xmsg list`。一个会话在**第一次工具调用**时自动注册成可投递目标，
 带上 cwd、model，以及直投需要的 pid / socket / 权限模式。没跑过任何工具调用的会话
-不会出现在列表里，真要发就 `--force`（但那样也没有直投坐标，只能排队）。
+不会出现在 xmsg peers 里；现在 `list` 还会合并 Codex `session_index.jsonl` 和 Claude
+`custom-title.json`，所以可以按自定义名查找未安装 xmsg hook 的会话。解析顺序固定为：
+完整 session id → 精确自定义名 → id 前缀。自定义名有多个历史/活跃候选时会拒绝发送并列出
+完整 id，避免“leader”之类常见名称误投。
+
+`xmsg queue` 是统一的只读观察命令：`xmsg` 行显示 `hook-next-tool`，Codex 行显示
+`next-turn`。Codex 官方队列没有优先级参数，也不会被 `--urgent` 改写；要把文字追加到
+Codex **当前进行中的 turn**，官方交互快捷键是 Enter（steer），Tab 才是 queue（下一轮）。
+脚本只能可靠调用 `codex queue`，因此输出和文档都明确写“下一轮”，不把排队误报为插话。
 
 `send` 的输出会说清走了哪条路：
 

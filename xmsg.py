@@ -52,6 +52,27 @@ DB_PATH = Path(
     )
 )
 
+# These are read-only discovery inputs.  They are deliberately configurable so
+# tests and operators using a separate profile can inspect the matching queues
+# without changing the xmsg database.
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", Path.home() / ".claude"))
+CODEX_QUEUE_DB = Path(
+    os.environ.get("XMSG_CODEX_QUEUE_DB", str(CODEX_HOME / "queue_1.sqlite"))
+)
+CODEX_SESSION_INDEX = Path(
+    os.environ.get("XMSG_CODEX_SESSION_INDEX", str(CODEX_HOME / "session_index.jsonl"))
+)
+CLAUDE_PROJECTS = Path(
+    os.environ.get("XMSG_CLAUDE_PROJECTS", str(CLAUDE_HOME / "projects"))
+)
+
+# A priority only affects messages waiting for the xmsg hook.  The official
+# `codex queue` command has no priority flag; its messages remain ordered by
+# Codex itself and are reported as "next turn" rather than "current turn".
+DEFAULT_MESSAGE_PRIORITY = 0
+URGENT_MESSAGE_PRIORITY = 100
+
 # A session that has not run a tool call in this long is no longer offered as a
 # delivery target by `xmsg list`. PreToolUse fires many times per turn, so a
 # live session refreshes this constantly; the only way to go quiet is to stop.
@@ -96,6 +117,7 @@ CREATE TABLE IF NOT EXISTS messages (
     from_session TEXT NOT NULL DEFAULT '',
     to_session TEXT NOT NULL,
     body TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
     -- NULL while queued. Set exactly once, inside the claiming transaction.
     delivered_at INTEGER,
     delivered_tool TEXT,
@@ -151,15 +173,23 @@ PEER_ADDED_COLUMNS = {
     "permission_mode": "TEXT NOT NULL DEFAULT ''",
 }
 
+MESSAGE_ADDED_COLUMNS = {
+    "priority": "INTEGER NOT NULL DEFAULT 0",
+}
+
 
 def migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing database up to the current `peers` shape."""
     have = {row["name"] for row in conn.execute("PRAGMA table_info(peers)")}
-    if not have:
-        return
-    for column, decl in PEER_ADDED_COLUMNS.items():
-        if column not in have:
-            conn.execute(f"ALTER TABLE peers ADD COLUMN {column} {decl}")
+    if have:
+        for column, decl in PEER_ADDED_COLUMNS.items():
+            if column not in have:
+                conn.execute(f"ALTER TABLE peers ADD COLUMN {column} {decl}")
+    message_have = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+    if message_have:
+        for column, decl in MESSAGE_ADDED_COLUMNS.items():
+            if column not in message_have:
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {column} {decl}")
 
 
 def connect(*, create: bool = True) -> sqlite3.Connection:
@@ -196,14 +226,172 @@ def ago(ts: int) -> str:
     return f"{d // 86400}d"
 
 
+def _timestamp(value: Any, fallback: int = 0) -> int:
+    """Parse the ISO timestamps used by Codex's index without making discovery fragile."""
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value:
+        try:
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return fallback
+    return fallback
+
+
+def _jsonl_records(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    records: list[dict[str, Any]] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if isinstance(value, dict):
+                    records.append(value)
+    except OSError:
+        return []
+    return records
+
+
+def discover_sessions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Merge xmsg peers with Codex and Claude's local session name indexes.
+
+    The peer row remains authoritative for liveness and direct-delivery
+    coordinates.  The other two sources are read-only indexes, so a session can
+    still be found by name before it has installed the xmsg hook.
+    """
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in conn.execute("SELECT * FROM peers ORDER BY last_seen_at DESC"):
+        item = dict(row)
+        item.update({"name": item.get("label") or "", "source": "xmsg", "updated_at": item.get("last_seen_at", 0)})
+        by_id[str(item["session_id"])] = item
+
+    # Codex writes one index row per rename.  Keep the last occurrence for a
+    # thread, which is the same meaning as the resume picker.
+    for item in _jsonl_records(CODEX_SESSION_INDEX):
+        session_id = str(item.get("id") or "")
+        if not session_id:
+            continue
+        record = by_id.setdefault(
+            session_id,
+            {"session_id": session_id, "tool": "codex", "source": "codex", "queued": 0},
+        )
+        record.update(
+            {
+                "tool": "codex",
+                "name": str(item.get("thread_name") or record.get("name") or ""),
+                "updated_at": _timestamp(item.get("updated_at"), int(record.get("updated_at") or 0)),
+                "source": record.get("source", "codex"),
+            }
+        )
+
+    # Claude's title files live below one or more project roots.  A malformed or
+    # partially written title must not make list/send fail.
+    try:
+        title_files = CLAUDE_PROJECTS.glob("*/????????-????-????-????-????????????/custom-title.json")
+    except OSError:
+        title_files = []
+    for path in title_files:
+        session_id = path.parent.name
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            name = str(value.get("customTitle") or "").strip() if isinstance(value, dict) else ""
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not name:
+            continue
+        record = by_id.setdefault(
+            session_id,
+            {"session_id": session_id, "tool": "claude", "source": "claude", "queued": 0},
+        )
+        record["name"] = name
+        record.setdefault("tool", "claude")
+        record["source"] = record.get("source", "claude")
+        try:
+            record["updated_at"] = max(int(record.get("updated_at") or 0), int(path.stat().st_mtime))
+        except OSError:
+            pass
+
+    return list(by_id.values())
+
+
+def codex_queue_rows() -> list[dict[str, Any]]:
+    """Read Codex's durable next-turn queue without taking a write lock."""
+    if not CODEX_QUEUE_DB.is_file():
+        return []
+    try:
+        db = sqlite3.connect(f"file:{CODEX_QUEUE_DB}?mode=ro", uri=True, timeout=0.2)
+        db.row_factory = sqlite3.Row
+        try:
+            rows = db.execute(
+                "SELECT id, thread_id, payload_json, queue_order, created_at_ms, updated_at_ms "
+                "FROM queued_items ORDER BY queue_order, created_at_ms"
+            ).fetchall()
+        finally:
+            db.close()
+    except (OSError, sqlite3.Error):
+        return []
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        payload = str(item.get("payload_json") or "")
+        try:
+            parsed = json.loads(payload)
+            text = parsed.get("UserInput", {}).get("content", [{}])[0].get("text", "")
+        except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
+            text = ""
+        item["summary"] = str(text or payload).replace("\n", " ").strip()[:160]
+        item["created_at"] = int(int(item.get("created_at_ms") or 0) / 1000)
+        item["updated_at"] = int(int(item.get("updated_at_ms") or 0) / 1000)
+        item["source"] = "codex"
+        item["state"] = "next-turn"
+        records.append(item)
+    return records
+
+
+def _session_by_id(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    return {str(row["session_id"]): row for row in discover_sessions(conn)}
+
+
+def _queue_name_map(conn: sqlite3.Connection) -> dict[str, str]:
+    return {sid: session_name(row) for sid, row in _session_by_id(conn).items()}
+
+
+def session_name(record: dict[str, Any]) -> str:
+    return str(record.get("name") or "")
+
+
+def _format_candidates(spec: str, rows: list[dict[str, Any]]) -> str:
+    lines = []
+    for row in rows:
+        seen = int(row.get("last_seen_at") or row.get("updated_at") or 0)
+        freshness = f", seen {ago(seen)} ago" if seen else ""
+        lines.append(
+            f"  {session_name(row) or '-'}  [{row.get('tool', '?')}/{row.get('source', '?')}] "
+            f"{row['session_id']}{freshness}"
+        )
+    return "\n".join(lines)
+
+
+def _record_is_live(row: dict[str, Any]) -> bool:
+    """Whether a discovered record is a current target rather than history."""
+    seen = int(row.get("last_seen_at") or 0)
+    return bool(seen and seen >= now() - PEER_STALE_SECONDS)
+
+
 # --------------------------------------------------------------------------
 # addressing
 # --------------------------------------------------------------------------
 def resolve_target(conn: sqlite3.Connection, spec: str, *, allow_unknown: bool) -> list[str]:
     """Turn a user-typed target into concrete session ids.
 
-    Accepts a full session id, a unique prefix (>=4 chars, like git), or the
-    literal `all` to fan out to every live peer except the sender.
+    Resolution is intentionally ordered: exact full id, exact custom name, then
+    an id prefix (>=4 chars).  Names are not assumed unique; an ambiguous name
+    is reported instead of silently sending to the wrong session.
     """
     spec = spec.strip()
     if spec == "all":
@@ -215,20 +403,34 @@ def resolve_target(conn: sqlite3.Connection, spec: str, *, allow_unknown: bool) 
             raise SystemExit("xmsg: no live sessions to broadcast to (try `xmsg list --all`)")
         return [r["session_id"] for r in rows]
 
-    exact = conn.execute("SELECT session_id FROM peers WHERE session_id = ?", (spec,)).fetchone()
+    discovered = discover_sessions(conn)
+    exact = [row for row in discovered if row["session_id"] == spec]
     if exact:
-        return [exact["session_id"]]
+        return [spec]
+
+    named = [row for row in discovered if session_name(row).casefold() == spec.casefold()]
+    live_named = [row for row in named if _record_is_live(row)]
+    # Local title/index files retain old sessions indefinitely.  Prefer current
+    # xmsg peers when present, so `xmsg send leader` does not become ambiguous
+    # merely because a machine has historical sessions with that title.
+    if live_named:
+        named = live_named
+    if len(named) == 1:
+        return [str(named[0]["session_id"])]
+    if len(named) > 1:
+        raise SystemExit(
+            f"xmsg: session name {spec!r} matches {len(named)} sessions:\n"
+            f"{_format_candidates(spec, named)}\n"
+            "Use the complete session id to choose one."
+        )
 
     if len(spec) >= 4:
-        rows = conn.execute(
-            "SELECT session_id, last_seen_at FROM peers WHERE session_id LIKE ? ORDER BY last_seen_at DESC",
-            (spec + "%",),
-        ).fetchall()
+        rows = [row for row in discovered if str(row["session_id"]).startswith(spec)]
+        rows.sort(key=lambda row: int(row.get("last_seen_at") or row.get("updated_at") or 0), reverse=True)
         if len(rows) == 1:
-            return [rows[0]["session_id"]]
+            return [str(rows[0]["session_id"])]
         if len(rows) > 1:
-            listed = "\n".join(f"  {r['session_id']}  (last seen {ago(r['last_seen_at'])} ago)" for r in rows)
-            raise SystemExit(f"xmsg: prefix {spec!r} matches {len(rows)} sessions:\n{listed}")
+            raise SystemExit(f"xmsg: prefix {spec!r} matches {len(rows)} sessions:\n{_format_candidates(spec, rows)}")
 
     if allow_unknown:
         # Deliberate escape hatch: a session that has not run a tool call yet
@@ -457,6 +659,11 @@ def direct_send_codex(
     if not exe:
         return False, "codex not found on PATH"
 
+    return invoke_codex_queue(exe, to_session, rendered)
+
+
+def invoke_codex_queue(exe: str, to_session: str, rendered: str) -> tuple[bool, str]:
+    """Invoke the supported Codex queue command after target resolution."""
     try:
         proc = subprocess.run(
             [exe, "queue", "--thread", to_session, "--message", rendered],
@@ -472,7 +679,7 @@ def direct_send_codex(
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         return False, f"codex queue failed: {detail[0] if detail else proc.returncode}"
-    return True, "codex queue"
+    return True, "codex queue accepted (next turn)"
 
 
 # --------------------------------------------------------------------------
@@ -629,8 +836,17 @@ def cmd_send(args: argparse.Namespace) -> int:
         for target in targets:
             cur = conn.execute(
                 "INSERT INTO messages (created_at, expires_at, from_label, from_tool, from_session, "
-                "to_session, body) VALUES (?,?,?,?,?,?,?)",
-                (t, t + ttl, label, tool, session, target, body),
+                "to_session, body, priority) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    t,
+                    t + ttl,
+                    label,
+                    tool,
+                    session,
+                    target,
+                    body,
+                    URGENT_MESSAGE_PRIORITY if args.urgent else int(args.priority),
+                ),
             )
             ids.append(int(cur.lastrowid or 0))
 
@@ -651,7 +867,8 @@ def cmd_send(args: argparse.Namespace) -> int:
                 where = "queued" if args.no_direct else "queued (hook delivery)"
                 print(f"{where} #{mid} -> {target}  (from {label}, ttl {ttl}s)")
             elif outcome[0]:
-                print(f"delivered #{mid} -> {target}  (from {label}, direct to idle session)")
+                delivery_note = "queued for Codex's next turn" if "codex" in outcome[1] else "direct to idle session"
+                print(f"delivered #{mid} -> {target}  (from {label}, {delivery_note})")
             else:
                 print(f"queued #{mid} -> {target}  (from {label}, ttl {ttl}s; direct: {outcome[1]})")
         if not session:
@@ -760,28 +977,90 @@ def cmd_list(args: argparse.Namespace) -> int:
     conn = connect()
     try:
         cutoff = 0 if args.all else now() - PEER_STALE_SECONDS
-        rows = conn.execute(
-            "SELECT p.*, "
-            "  (SELECT COUNT(*) FROM messages m WHERE m.to_session = p.session_id "
-            "     AND m.delivered_at IS NULL AND m.expired_at IS NULL) AS queued "
-            "FROM peers p WHERE p.last_seen_at >= ? ORDER BY p.last_seen_at DESC",
-            (cutoff,),
-        ).fetchall()
+        pending = {
+            str(row["to_session"]): int(row["queued"])
+            for row in conn.execute(
+                "SELECT to_session, COUNT(*) AS queued FROM messages "
+                "WHERE delivered_at IS NULL AND expired_at IS NULL GROUP BY to_session"
+            )
+        }
+        codex_pending: dict[str, int] = {}
+        for row in codex_queue_rows():
+            sid = str(row["thread_id"])
+            codex_pending[sid] = codex_pending.get(sid, 0) + 1
+        rows: list[dict[str, Any]] = []
+        for row in discover_sessions(conn):
+            sid = str(row["session_id"])
+            row["queued"] = pending.get(sid, 0)
+            row["codex_queued"] = codex_pending.get(sid, 0)
+            row["direct"] = reachable_now(row) if row.get("tool") in ("claude", "codex") else False
+            recent = int(row.get("last_seen_at") or row.get("updated_at") or 0) >= cutoff
+            if args.all or recent or row["queued"] or row["codex_queued"]:
+                rows.append(row)
+        rows.sort(key=lambda row: int(row.get("last_seen_at") or row.get("updated_at") or 0), reverse=True)
         if args.json:
-            print(json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2))
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
             return 0
         if not rows:
-            print("no sessions registered yet (a session registers on its first tool call)")
+            print("no sessions found (xmsg peers and local Codex/Claude indexes are empty or stale)")
             return 0
-        print(f"{'SESSION':<38} {'TOOL':<7} {'SEEN':>5} {'Q':>3} {'DIRECT':<6}  CWD")
+        print(f"{'NAME':<18} {'SESSION':<38} {'TOOL':<7} {'SEEN':>5} {'Q':>3} {'CODEX':>5} {'DIRECT':<6}  CWD")
         for r in rows:
-            # "direct" answers a question the other columns cannot: whether a
-            # message sent now would reach this session while it sits idle, or
-            # only once it runs a tool again.
-            direct = "yes" if reachable_now(r) else "-"
             print(
-                f"{r['session_id']:<38} {r['tool']:<7} {ago(r['last_seen_at']):>5} "
-                f"{r['queued']:>3} {direct:<6}  {r['cwd']}"
+                f"{session_name(r)[:18]:<18} {r['session_id']:<38} {r.get('tool', '-'): <7} "
+                f"{ago(int(r.get('last_seen_at') or r.get('updated_at') or now())):>5} "
+                f"{r['queued']:>3} {r['codex_queued']:>5} {'yes' if r['direct'] else '-':<6}  {r.get('cwd', '')}"
+            )
+    finally:
+        conn.close()
+    return 0
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    """Show both xmsg's hook queue and Codex's official next-turn queue."""
+    conn = connect()
+    try:
+        names = _queue_name_map(conn)
+        requested = (args.thread or args.name or "").strip()
+        allowed: set[str] | None = None
+        if requested:
+            allowed = set(resolve_target(conn, requested, allow_unknown=False))
+        records: list[dict[str, Any]] = []
+        where = "delivered_at IS NULL AND expired_at IS NULL"
+        for row in conn.execute(f"SELECT * FROM messages WHERE {where} ORDER BY priority DESC, id"):
+            if allowed is not None and row["to_session"] not in allowed:
+                continue
+            item = dict(row)
+            item.update(
+                {
+                    "kind": "xmsg",
+                    "source": "xmsg",
+                    "state": "hook-next-tool",
+                    "name": names.get(str(row["to_session"]), ""),
+                    "summary": str(row["body"] or "").replace("\n", " ").strip()[:160],
+                }
+            )
+            records.append(item)
+        for item in codex_queue_rows():
+            if allowed is not None and item["thread_id"] not in allowed:
+                continue
+            item["kind"] = "codex"
+            item["name"] = names.get(str(item["thread_id"]), "")
+            records.append(item)
+        records.sort(key=lambda row: (int(row.get("queue_order", row.get("priority", 0))), int(row.get("created_at", row.get("created_at_ms", 0)))))
+        records = records[: max(0, int(args.limit))]
+        if args.json:
+            print(json.dumps(records, ensure_ascii=False, indent=2))
+            return 0
+        if not records:
+            print("queue is empty")
+            return 0
+        print(f"{'SOURCE':<7} {'STATE':<16} {'NAME':<18} {'THREAD/TO':<38} SUMMARY")
+        for row in records:
+            target = str(row.get("thread_id") or row.get("to_session") or "")
+            print(
+                f"{str(row.get('source', '')):<7} {str(row.get('state', '')):<16} "
+                f"{str(row.get('name', ''))[:18]:<18} {target:<38} {str(row.get('summary', ''))}"
             )
     finally:
         conn.close()
@@ -889,15 +1168,18 @@ def claim(conn: sqlite3.Connection, session_id: str, tool: str, event: str) -> l
             "WHERE id IN ("
             "  SELECT id FROM messages"
             "   WHERE to_session = ? AND delivered_at IS NULL AND expired_at IS NULL AND expires_at >= ?"
-            "   ORDER BY id LIMIT ?"
-            ") RETURNING id, created_at, from_label, from_tool, from_session, body",
+            "   ORDER BY priority DESC, id LIMIT ?"
+            ") RETURNING id, created_at, from_label, from_tool, from_session, body, priority",
             (t, tool, event, session_id, t, MAX_MESSAGES_PER_INJECT),
         ).fetchall()
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
         raise
-    return rows
+    # SQLite does not promise that UPDATE ... RETURNING preserves the order of
+    # its subquery.  Re-sort after the atomic claim so a high-priority message
+    # is also rendered first to the receiver.
+    return sorted(rows, key=lambda row: (-int(row["priority"] or 0), int(row["id"])))
 
 
 def host_pid() -> int:
@@ -1169,6 +1451,18 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("text", nargs="?", default="", help="message body ('-' or omit to read stdin)")
     s.add_argument("--from", dest="from_label", default="", help="override the sender label")
     s.add_argument("--ttl", type=int, default=None, help=f"seconds before giving up (default {DEFAULT_TTL_SECONDS})")
+    priority = s.add_mutually_exclusive_group()
+    priority.add_argument(
+        "--urgent",
+        action="store_true",
+        help="put ahead of ordinary xmsg hook messages (does not change Codex's official queue)",
+    )
+    priority.add_argument(
+        "--priority",
+        type=int,
+        default=DEFAULT_MESSAGE_PRIORITY,
+        help="xmsg hook priority (higher first; default 0)",
+    )
     s.add_argument("--force", action="store_true", help="allow an unregistered session id")
     s.add_argument(
         "--no-direct",
@@ -1176,6 +1470,13 @@ def main(argv: list[str] | None = None) -> int:
         help="skip direct delivery; queue for the receiver's next hook instead",
     )
     s.set_defaults(fn=cmd_send)
+
+    s = sub.add_parser("queue", help="show xmsg and Codex next-turn queues together")
+    s.add_argument("--thread", default="", help="filter by complete session id, prefix, or custom name")
+    s.add_argument("--name", default="", help="alias for --thread, useful for scripts")
+    s.add_argument("--limit", type=int, default=50)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_queue)
 
     s = sub.add_parser("list", help="list sessions available as delivery targets")
     s.add_argument("--all", action="store_true", help="include sessions that have gone quiet")

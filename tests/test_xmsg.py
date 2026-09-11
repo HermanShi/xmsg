@@ -363,6 +363,101 @@ class TestPeerRegistry(Base):
         finally:
             conn.close()
 
+    def test_exact_session_id_wins_over_a_same_named_session(self) -> None:
+        self.hook()
+        title = self.tmp / "titles" / "project" / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" / "custom-title.json"
+        title.parent.mkdir(parents=True)
+        title.write_text('{"customTitle":"target"}')
+        self.x.CLAUDE_PROJECTS = title.parents[2]
+        conn = self.x.connect()
+        try:
+            self.assertEqual(self.x.resolve_target(conn, self.sid, allow_unknown=False), [self.sid])
+        finally:
+            conn.close()
+
+    def test_unique_custom_name_resolves_without_a_peer(self) -> None:
+        title = self.tmp / "titles" / "project" / "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" / "custom-title.json"
+        title.parent.mkdir(parents=True)
+        title.write_text('{"customTitle":"unique-target"}')
+        self.x.CLAUDE_PROJECTS = title.parents[2]
+        conn = self.x.connect()
+        try:
+            self.assertEqual(self.x.resolve_target(conn, "unique-target", allow_unknown=False), ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"])
+        finally:
+            conn.close()
+
+    def test_ambiguous_historical_custom_name_is_refused(self) -> None:
+        root = self.tmp / "titles"
+        for sid in ("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "dddddddd-dddd-4ddd-8ddd-dddddddddddd"):
+            title = root / "project" / sid / "custom-title.json"
+            title.parent.mkdir(parents=True)
+            title.write_text('{"customTitle":"same-name"}')
+        self.x.CLAUDE_PROJECTS = root
+        conn = self.x.connect()
+        try:
+            with self.assertRaises(SystemExit):
+                self.x.resolve_target(conn, "same-name", allow_unknown=False)
+        finally:
+            conn.close()
+
+    def test_codex_session_index_is_discoverable_by_name(self) -> None:
+        index = self.tmp / "session_index.jsonl"
+        index.write_text('{"id":"codex-session","thread_name":"codex-target","updated_at":"2026-09-12T00:00:00Z"}\n')
+        self.x.CODEX_SESSION_INDEX = index
+        conn = self.x.connect()
+        try:
+            self.assertEqual(self.x.resolve_target(conn, "codex-target", allow_unknown=False), ["codex-session"])
+        finally:
+            conn.close()
+
+    def test_codex_queue_reader_degrades_for_missing_or_corrupt_db(self) -> None:
+        self.x.CODEX_QUEUE_DB = self.tmp / "missing.sqlite"
+        self.assertEqual(self.x.codex_queue_rows(), [])
+        broken = self.tmp / "broken.sqlite"
+        broken.write_text("not sqlite")
+        self.x.CODEX_QUEUE_DB = broken
+        self.assertEqual(self.x.codex_queue_rows(), [])
+
+    def test_codex_queue_rows_include_name_and_payload_summary(self) -> None:
+        queue = self.tmp / "queue.sqlite"
+        db = sqlite3.connect(queue)
+        try:
+            db.execute(
+                "CREATE TABLE queued_items (id TEXT, thread_id TEXT, payload_json TEXT, "
+                "queue_order INTEGER, created_at_ms INTEGER, updated_at_ms INTEGER)"
+            )
+            db.execute(
+                "INSERT INTO queued_items VALUES (?,?,?,?,?,?)",
+                ("item-1", "codex-session", '{"UserInput":{"content":[{"type":"text","text":"hello queue"}]}}', 0, 1000, 1000),
+            )
+            db.commit()
+        finally:
+            db.close()
+        self.x.CODEX_QUEUE_DB = queue
+        rows = self.x.codex_queue_rows()
+        self.assertEqual(rows[0]["thread_id"], "codex-session")
+        self.assertEqual(rows[0]["summary"], "hello queue")
+
+    def test_urgent_message_is_claimed_before_normal_message(self) -> None:
+        self.hook()
+        conn = self.x.connect()
+        try:
+            t = self.x.now()
+            conn.execute(
+                "INSERT INTO messages (created_at, expires_at, from_label, from_tool, from_session, to_session, body, priority) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (t, t + 3600, "p", "", "", self.sid, "normal", 0),
+            )
+            conn.execute(
+                "INSERT INTO messages (created_at, expires_at, from_label, from_tool, from_session, to_session, body, priority) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (t, t + 3600, "p", "", "", self.sid, "urgent", 100),
+            )
+            claimed = self.x.claim(conn, self.sid, "codex", "PreToolUse")
+            self.assertEqual([row["body"] for row in claimed], ["urgent", "normal"])
+        finally:
+            conn.close()
+
 
 class TestStopWindow(Base):
     """The second delivery window: the moment a turn ends and goes idle.

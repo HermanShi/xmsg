@@ -6,6 +6,7 @@
 #
 #   xmsg list                       which sessions can receive right now
 #   xmsg send <session|prefix> "…"  queue a message
+#   xmsg queue                      inspect xmsg + Codex queues together
 #   xmsg outbox                     did it land?
 #   xmsg doctor                     config + queue health
 #
