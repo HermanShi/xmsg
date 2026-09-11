@@ -449,6 +449,84 @@ Claude 那边 host 会把消息包成 `<cross-session-message>` 并加上「这�
 顺带一个观察：`~/.codex/thread-writer-locks/<id>.lock` 在进程退出后仍留着且未被持有，
 所以**锁文件不能当活跃判据**，仍然要靠 pid + 启动时刻。
 
+### 从外面给一个 Codex 会话派活：实测走通的顺序（2026-09-11，0.154.0）
+
+一次真实场景：Claude 侧的 leader 会话要把一份任务 brief 派给同机的 Codex 会话。
+按上面两节的说法应该直接 `codex queue` 就行，实际卡了三道，记下来免得重走。
+
+**① `xmsg send` 认不出 Codex thread —— 它不是 xmsg 的 peer。**
+
+`xmsg list` 只列出注册过的会话，而注册发生在**接收方自己的 hook 里**。Codex 侧装的是
+`SessionStart`/`PreToolUse` 那套 agent-memory hook，**不是 xmsg 的 hook**，所以那个
+thread 从来没往 `peers` 表写过一行 ⇒ `xmsg: no session matches '01a0908d'`。
+
+`--force` 能让它收下，但**结果是 `queued (hook delivery)` 而不是直投** —— 因为
+`peers` 里没有这个 thread 的投递坐标，xmsg 既不知道它是 codex（不会去调
+`codex queue`），也没有 socket 可连。而 Codex 那边没装 xmsg 的 hook，
+**这条队列消息永远不会有人来领**。
+
+⚠️ 所以：**`xmsg --force` 对一个没装 xmsg hook 的外部工具会话，等于把消息扔进黑洞**，
+而 `outbox` 只会一直显示 `[queued, …s of ttl left]`，看起来像「还没投出去」而不是
+「投不出去」。这两种状态在 outbox 里长得一样。
+
+同一次里还撞到一个小的：`--force` 时没设 `XMSG_FROM_SESSION`，消息被标成
+`unattributed` —— 而 unattributed 的语义是「告诉接收方别单独据此行动」（见上文）。
+派活的 brief 被标成这个，等于让对方先怀疑再动手。要么补齐 `XMSG_FROM_*`，
+要么别走这条路。
+
+**② 正确路径是官方命令，但需要 rollout 已落盘。**
+
+```bash
+codex queue --thread <full-uuid> --message "$(cat brief.md)"
+```
+
+⚠️ **`--thread` 要完整 UUID，不吃前缀**（xmsg 那套 `>=4 字符唯一前缀` 是 xmsg 自己的
+便利，不是 codex 的）。thread id 从 `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl`
+的文件名里取，或从 `~/.codex/thread-writer-locks/<id>.lock` 取。
+
+第一次调用报了：
+
+```
+Error: failed to queue session message: thread/queue/add failed: failed to read thread:
+invalid thread-store request: no rollout found for thread id <id> (code -32603)
+```
+
+这就是上一节说的「还没跑完任何一轮的会话会被拒」。⚠️ 但**判据不是「进程在不在」**：
+当时 codex 进程活着（pid 正常）、writer lock 也**确实被它持有**（`fuser` 验过，
+不是残留锁），而 rollout 文件仍不存在 —— 一个开着但一轮都没跑完的会话就是这个形态。
+**让人往那个会话里说一句话**，rollout 立刻落盘（实测 252KB），同一条命令随即成功。
+
+⇒ 活跃性的三个信号是**三件不同的事**，别互相顶替：
+
+| 信号 | 证明什么 | 不能证明什么 |
+| --- | --- | --- |
+| 进程存在 | 会话开着 | 能不能收消息 |
+| writer lock 被持有（`fuser`）| 会话开着且在写这个 thread | rollout 已落盘 |
+| rollout 文件存在 | `codex queue` 能收 | 会话还活着（死会话的 rollout 也在，见上节） |
+
+**③ exit 0 之后仍然要验落盘。**
+
+`codex queue` 成功时打 `Queued message <msg-id> for thread <thread-id>.`
+按上一节那条「排进去 ≠ 送到了」，这里补一条**能直接查的判据**：消息落在
+`~/.codex/queue_1.sqlite` 的 `queued_items` 表（`id` / `thread_id` / `payload_json`），
+Codex 领走后该行消失。
+
+```bash
+sqlite3 'file:'$HOME'/.codex/queue_1.sqlite?mode=ro' \
+  'select id, thread_id, substr(payload_json,1,60) from queued_items'
+```
+
+⚠️ **不要去 rollout 里 grep 自己的正文来确认送达** —— 那次实测里 `queued_items`
+明明有那一行，而 rollout 里四个特征串全部 0 命中，因为**消息还在队列里没被消费**，
+rollout 只记已进入对话的内容。拿 rollout 当判据会得出「投递失败」的错误结论，
+然后重发一遍（对方就收到两份）。
+
+所以要判「对方真的开始干了」，看的是 `queued_items` 那行**消失**，
+不是命令的退出码，也不是 rollout 里有没有你的字。
+
+**顺带：两条路都发了怎么办。** ①的队列消息撤回用 `xmsg cancel <id>`，
+不然万一将来 Codex 侧装上了 xmsg hook，它会在 TTL 内把那条陈旧消息领走一次。
+
 ### Codex 的 hook 信任门槛（栽过两次的坑）
 
 Codex 把每个 hook 条目的哈希记在 `~/.codex/config.toml` 的
