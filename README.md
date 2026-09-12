@@ -69,6 +69,75 @@ turn 去处理。所以它能触达一个正停在提示符上、没有任何 tu
 **发送方没有 peer 记录时（人在终端敲命令、cron 任务），就不带声明，消息按预期被 hold。**
 这是正确结果而不是待修的缺口：替发送方编一个声明等于伪造它的权限背书。
 
+#### Codex → Claude 默认被 hold，解法是 `crossSessionInbound: accept` + **重启会话**
+
+**Codex 侧永远没有 peer 记录** —— 它不开 uds socket（见上一节「只对 Claude」），
+`permission_mode` 从来没上报过 ⇒ xmsg 无从推导 `from-mode` ⇒ 发出的信封不带声明。
+接收方若是 bypass 模式的 Claude 会话，**每一条都会 hold**。
+
+这不是配错了，是两个前提叠加的必然结果。要区分三件事：
+
+| | 归属 | 能不能改 |
+|---|---|---|
+| Codex 不上报 `permission_mode` | Codex CLI 没有这个概念 | 不能 |
+| xmsg 不替它编一个声明 | 本工具的刻意设计（见上） | 不该 |
+| 接收方 hold 未声明来源的消息 | Claude Code 的 ingress 闸门 | 见下 |
+
+第三项在接收侧有个开关：Claude Code 的 **`crossSessionInbound`** 设置，
+写在 `~/.claude/settings.json`（或项目 `.claude/settings.json`），取值 `accept` / `hold`（默认）/ `refuse`，
+也可以在会话里跑 `/config` 找 **Messages from your other sessions** 那行。
+
+⚠️⚠️ **改完必须重启会话，同一会话内改了不生效。** 2026-09-12 实测（bypass 模式的
+Claude 会话，发送方是 Codex）：
+
+| 时点 | Codex 发来的消息 |
+|---|---|
+| 改配置前 | 每条都 hold 等确认 |
+| 写入 `"crossSessionInbound": "accept"` 后，**同一会话内** | **仍然 hold** |
+| 重启（WSL 重启 + 新会话）后 | **直接到达，不再 hold** ✅ |
+
+**为什么会误判成「不需要重启」** —— 读二进制会看到策略是每条消息即时重算的：
+
+```js
+function v9e(e){ return R(e, S(m(e))) }   // 每条 peer 消息投递时调用 S()
+// S() 第一步就读 crossSessionInbound，有显式设置就直接返回该策略，
+// 不再走「权限模式是否匹配」那套判断
+```
+
+⇒ 据此推出「下一条消息就该走 `case "accept"`」是**错的**，因为
+**即时重算的是策略判断，不是配置文件** —— 设置在会话启动时读进内存。
+这两件事很容易混：`S()` 每次都调，但它读的是内存里那份已加载的设置。
+
+⇒ 通用形状：**「这个函数每次都被调用」不等于「它读的数据每次都重新加载」。**
+
+配置项名字可以自证（`strings` 扫 `claude.exe` 命中 `crossSessionInbound`，
+旁边还有 `crossSessionInboxRowVisible` / `crossSessionMessaging`；
+二进制里那条提示逐字写着 *"The sender did not attest its permission mode and this session
+bypasses prompts. Review it below, or set `crossSessionInbound` to `accept`"* ——
+正是这个场景）。
+
+**若重启后仍被 hold**，代码里还有两个候选：
+
+1. **settings 被判为无效值** —— 有个检查看 `errors` 里有没有 `severity === "warning"`
+   的条目，对应提示：*"A settings file has an unrecognized `crossSessionInbound` value
+   (see the settings warning), so messages are held while it is present"*。
+   ⇒ **自查：`/config` 看 Messages from your other sessions 那行显示 `accept` 还是 `hold`。**
+   显示 `hold` 就是设置没被采纳（键写错层级、值拼错），不是「没生效」。
+2. **kill-switch 优先于一切设置** —— 判定链第一步
+   `if (!Ko()) return {policy:"refuse", refuseCause:"kill-switch"}`。
+
+两条还有两个已知限制，无论上面那条成不成立都适用：
+
+- **仓库级设置只能收紧不能放宽** —— 某项目的 `.claude/settings.json` 若设了 `hold`，
+  全局的 `accept` 在那个项目里不生效（二进制原文：*"a repo may only tighten, so your own
+  'accept' cannot override it"*）。组织的 managed settings 同理。
+- **它降的是一道安全闸门**，作用于该配置文件覆盖的所有会话，不只你当下这一个。
+
+⇒ 现实可行的减负方式是**让 Codex 少发、发大块**，而不是关闸门。
+反方向（Claude → Codex）不受影响：带上 `XMSG_FROM_TOOL` / `XMSG_FROM_SESSION` 就能正常署名投递
+（漏了这两个环境变量则以 `unattributed` 送达，接收方被告知不要单凭它行动 —— 那是署名缺失，
+与本节的 hold 是两件事）。
+
 信封解析是严格的 —— host 会把解析结果重新渲染一遍跟原文比对，所以某个属性里出现
 越界字符不只是那个属性失效，而是**整个信封解析失败、消息退化成 unattributed**。
 `envelope()` 因此逐个属性校验，宁可丢掉一个属性，也不赌整个信封。
