@@ -166,7 +166,7 @@ class TestSenderAttribution(Base):
     """A receiver must be able to tell a named peer from an unverified sender.
 
     Real incident (2026-08-29): a message asking for an irreversible action
-    ("直接合并那个 MR") arrived rendered as `<user>@<host>` -- byte-identical to
+    (merge that MR) arrived rendered as `<user>@<host>` -- byte-identical to
     what this session's own CLI calls produce, so the receiver could not tell
     whether its user, a script, or its own loop-back had asked. Nothing here is
     authentication; a sender can still write any label it likes. What these
