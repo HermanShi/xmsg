@@ -770,3 +770,7 @@ Codex 把每个 hook 条目的哈希记在 `~/.codex/config.toml` 的
 信任记录、跳过 Codex 特意设的审阅环节 —— 别那么干。
 
 判断某条到底生效没有：数 `hook: <Event>` 出现几次，而不是看有没有报错。
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。
