@@ -110,10 +110,12 @@ turn 去处理。所以它能触达一个正停在提示符上、没有任何 tu
 ## 安装
 
 只依赖 `python3`（标准库，无第三方包）与 host 自己的 hook 机制。
+可选的 `codex-history` 需要 Python 3.11+、Codex CLI；`fzf` 仅用于增强选择体验。
 
 ```bash
 git clone https://github.com/HermanShi/xmsg.git ~/agent-msg
 ln -s ~/agent-msg/bin/xmsg ~/bin/xmsg      # 或拷进任何 PATH 目录
+ln -s ~/agent-msg/bin/codex-history ~/bin/codex-history
 xmsg doctor                                # 建库 + 自检
 ```
 
@@ -132,7 +134,10 @@ clone 到 `~/agent-msg` 以外的路径也行，此时给两个 host 的 hook �
 | `~/agent-msg/xmsg.py` | 全部逻辑（发送端 CLI + 接收端 hook），单文件无依赖 |
 | `~/agent-msg/xmsg-hook.sh` | hook 入口，负责 fail-open 与超时兜底 |
 | `~/agent-msg/bin/xmsg` | 薄 dispatcher，软链进 PATH 后就是命令名 `xmsg` |
+| `~/agent-msg/codex_history.py` | 跨 provider 的只读历史索引与安全恢复选择器 |
+| `~/agent-msg/bin/codex-history` | 选择器命令入口 |
 | `~/agent-msg/tests/test_xmsg.py` | 57 个测试 |
+| `~/agent-msg/tests/test_codex_history.py` | 选择、恢复防护、只读索引及 Unix WebSocket 协议测试 |
 | `~/.local/share/agent-msg/messages.sqlite3` | 消息队列（本机运行态，不进版本库） |
 
 消息库**故意不用** `~/.agent-memory/index.sqlite3`：那个库每分钟被 systemd timer
@@ -148,6 +153,12 @@ xmsg queue                        # 同时查看 xmsg hook 队列和 Codex 官�
 xmsg queue --name leader          # 按自定义会话名筛选（重名会列候选，不会误投）
 xmsg-find-session leader           # 只输出自定义会话名对应的完整 session id
 xmsg-find-session leader --json    # 输出完整发现记录
+
+codex-history list                 # 跨 provider 列出 Codex 历史
+codex-history list --provider tianzhi --query 编排
+codex-history list --include-archived
+codex-history resume               # fzf（没有 fzf 时为编号选择）
+codex-history resume <完整 UUID> --dry-run
 
 xmsg send 01a04cbe "把 #163 的结论同步给我"     # 全 id 或 >=4 字符的唯一前缀
 xmsg send leader "请优先看这个"                 # 自定义名；完整 session id 优先
@@ -178,6 +189,52 @@ Codex **当前进行中的 turn**，官方交互快捷键是 Enter（steer），
 如果脚本或人工操作只需要完整 session id，可以使用独立的
 `xmsg-find-session <自定义名>`。它复用同一套发现和解析规则：完整 id 优先、其次精确
 自定义名，再其次 id 前缀；重名会列出候选并以非零状态退出，不会猜一个发送。
+
+### 统一选择 Codex 历史（`codex-history`）
+
+`codex-history` 统一的是「查找和选择」，不是把不同 provider 的 JSONL/SQLite
+拼成一份历史。它默认通过 Codex CLI 自带的 managed app-server `thread/list` 查询；
+`modelProviders=[]` 表示所有 provider，结果按 `updated_at` 倒序分页。查询只读，
+不会启动模型、重写 rollout 或修改 provider 配置。若本机没有 managed daemon，先运行：
+
+```bash
+codex app-server daemon bootstrap  # 一次性安装本地 daemon 管理
+codex app-server daemon start
+```
+
+客户端使用 app-server 的本地 Unix WebSocket 控制 socket，并在连接后执行
+`initialize`/`initialized`，因此不会把 stdio JSONL 当成控制协议。若 daemon 仍不可用，
+`list` 会明确提示并只读降级到最新的 `state_<n>.sqlite`；可以用
+`--backend app-server` 强制失败以排查环境，或用 `--backend sqlite` 明确选择保底。
+保底不会创建、写入、迁移或合并 SQLite，也不会扫描旧代数据库。API 返回缺少的 model/name
+可按同一 ID 从本地索引补齐，但不会把 API 未返回的记录混入结果。所有数据源都在同一个
+`CODEX_HOME` 下；`--home` 可以选择另一套 Codex home，不会跨 home 合库。
+
+`bootstrap` 的管理方式依平台而异，以命令的 JSON 输出为准；它可能启用 managed CLI
+自动更新。本工具不会修改该策略、不启用远程控制，也不开放 TCP 端口。
+
+展示字段包含完整 ID、名称、provider、model、cwd、更新时间、归档和状态。选择规则是：
+完整 UUID → 精确自定义名称 → 唯一 ID 前缀；名称或前缀重名时拒绝猜测并列出完整 ID。
+没有 `fzf` 时退化为编号选择；非 TTY 不会自动选唯一结果，脚本应使用完整 ID。
+
+恢复时默认沿用历史记录的 provider、model 和 cwd，通过参数数组调用官方
+`codex resume <UUID>`。provider/model 缺失、provider 已从配置删除、cwd 不存在、会话
+已归档或检测到活跃进程时会停止并说明原因；不会静默更换 provider、取消归档或进入当前目录。
+`notLoaded` 只表示不在所连接的 daemon 内，`unknown` 表示缺少状态证据，都不能证明没有
+另一独立 CLI 在使用该历史。PID + 启动时间的额外检查复用 xmsg peers；未安装 hook 的
+独立 CLI 可能无法被此检查识别，恢复前仍应确认原终端已退出。
+若确实要换 provider，必须同时使用 `--switch-provider <name> --model <model>`，并确认一次：
+
+```bash
+codex-history resume <UUID> --switch-provider tianzhi --model <model> --dry-run
+codex-history resume <UUID> --switch-provider tianzhi --model <model>
+```
+
+这会明确提示「历史上下文将发送给新 provider」。历史实际上共存在同一个 Codex home，
+本工具不改写旧记录的 provider 来伪装统一；显式跨 provider 恢复后的新轮次仍由 Codex 持久化。
+`--dry-run` 只预览命令，不启动 Codex，也不向 provider 发送任何历史。
+
+接口依据：[官方 app-server 文档](https://learn.chatgpt.com/docs/app-server#list-threads-with-pagination--filters)。
 
 `send` 的输出会说清走了哪条路：
 
@@ -336,7 +393,7 @@ hook 报 Errno 2。第二、三行兜底是冗余的，属于纵深防御而非�
 ## 跑测试
 
 ```bash
-python3 -m pytest ~/agent-msg/tests/test_xmsg.py -q     # 57 passed, 3 subtests passed
+python3 -m unittest discover -s ~/agent-msg/tests -q   # xmsg + codex-history
 ```
 
 覆盖投递、幂等（含 8 线程并发只准一条命中）、定址（前缀/歧义/广播/过期 peer）、
