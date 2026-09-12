@@ -303,26 +303,6 @@ codex-history resume <UUID> --switch-provider tianzhi --model <model>
 本工具不改写旧记录的 provider 来伪装统一；显式跨 provider 恢复后的新轮次仍由 Codex 持久化。
 `--dry-run` 只预览命令，不启动 Codex，也不向 provider 发送任何历史。
 
-### 在两台机器间迁移一个可恢复会话（`codex-migrate-thread`）
-
-Codex 的 paginated 历史同时依赖 rollout JSONL、`state_5.sqlite` 的 `threads` 行和
-`thread_history_1.sqlite` 的正文/投影状态。不要同步整个 SQLite（各机运行态会独立迁移），
-而是在源端停止该会话后，把 JSONL 先同步到目标对应的 `CODEX_HOME`，再运行：
-
-```bash
-codex-migrate-thread --src-home /path/to/source/.codex \
-  --dst-home ~/.codex --thread <完整 UUID>
-```
-
-命令会校验源/目标 rollout 字节完全一致，源库以只读方式打开；目标库在修改前自动备份到
-`codex-migrate-backup-<时间戳>/`。迁移只追加缺失的 `threads`、`thread_turns`、
-`thread_items` 和 projection 行，重复执行幂等；目标已有同 ID 但内容不同，或 projection
-与 rollout 快照不一致时拒绝操作，绝不覆盖目标本地新增内容。迁移后请用目标机真实
-`codex resume <UUID>` 继续提问验证正文可读；这不是实时双向同步，源端后续新增轮次需在
-停止写入后重新生成快照并再次迁移。
-
-接口依据：[官方 app-server 文档](https://learn.chatgpt.com/docs/app-server#list-threads-with-pagination--filters)。
-
 `send` 的输出会说清走了哪条路：
 
 ```
