@@ -33,6 +33,16 @@ def load_impl(db_path: Path):
     database rather than the operator's real one.
     """
     os.environ["XMSG_DB"] = str(db_path)
+    for key in (
+        "XMSG_FROM",
+        "XMSG_FROM_TOOL",
+        "XMSG_FROM_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDECODE",
+        "XMSG_REMOTE",
+        "XMSG_REMOTE_UP",
+    ):
+        os.environ.pop(key, None)
     spec = importlib.util.spec_from_file_location(f"xmsg_{db_path.stem}", IMPL)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
@@ -60,6 +70,11 @@ class Base(unittest.TestCase):
         self.db = self.tmp / "messages.sqlite3"
         self.x = load_impl(self.db)
         self.sid = PAYLOAD["session_id"]
+        # live_claude_sessions() looks at SOCK_DIRS; keep tests off the real
+        # host sockets or `send all` / list would pick up this machine's sessions.
+        self.sockdir = self.tmp / "cc-socks"
+        self.sockdir.mkdir()
+        self.x.SOCK_DIRS = [self.sockdir]
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -784,6 +799,32 @@ class DirectBase(Base):
         self.assertIsNotNone(self.x.pid_start_time(proc.pid), "target process never appeared")
         return proc.pid
 
+    def listener(self, path: Path) -> tuple[threading.Thread, list]:
+        got: list = []
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(path))
+        srv.listen(1)
+
+        def serve() -> None:
+            try:
+                conn, _ = srv.accept()
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                got.append(buf)
+                conn.close()
+            except OSError:
+                pass
+            finally:
+                srv.close()
+
+        th = threading.Thread(target=serve, daemon=True)
+        th.start()
+        return th, got
+
 
 class TestDirectDeliveryTargeting(DirectBase):
     """Who direct delivery will and will not write to.
@@ -940,40 +981,6 @@ class TestDirectDeliveryOverSocket(DirectBase):
     pins that a successful write claims the row so the hook cannot deliver it a
     second time.
     """
-
-    def listener(self, path: Path) -> tuple[threading.Thread, list]:
-        got: list = []
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(str(path))
-        srv.listen(1)
-
-        def serve() -> None:
-            try:
-                conn, _ = srv.accept()
-                buf = b""
-                while not buf.endswith(b"\n"):
-                    chunk = conn.recv(65536)
-                    if not chunk:
-                        break
-                    buf += chunk
-                got.append(buf)
-                conn.close()
-            except OSError:
-                pass
-            finally:
-                srv.close()
-
-        th = threading.Thread(target=serve, daemon=True)
-        th.start()
-        return th, got
-
-    def setUp(self) -> None:
-        super().setUp()
-        # Point the module's socket lookup at a scratch directory so the test
-        # never touches a real session's socket.
-        self.sockdir = self.tmp / "cc-socks"
-        self.sockdir.mkdir()
-        self.x.SOCK_DIRS = [self.sockdir]
 
     def test_wire_shape_is_one_json_line(self) -> None:
         pid = self.spawn_target()
@@ -1232,6 +1239,16 @@ class TestCli(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="xmsg-cli-"))
         self.env = dict(os.environ)
         self.env.pop("XMSG_NO_FAILOPEN", None)
+        for key in (
+            "XMSG_FROM",
+            "XMSG_FROM_TOOL",
+            "XMSG_FROM_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDECODE",
+            "XMSG_REMOTE",
+            "XMSG_REMOTE_UP",
+        ):
+            self.env.pop(key, None)
         self.env["XMSG_DB"] = str(self.tmp / "messages.sqlite3")
 
     def tearDown(self) -> None:
@@ -1335,6 +1352,142 @@ class TestCli(unittest.TestCase):
         )
         self.assertNotEqual(found.returncode, 0)
         self.assertIn("matches 2 sessions", found.stderr)
+
+
+
+class TestLiveClaudeIdle(DirectBase):
+    """Idle Claude hosts that have never run the xmsg hook are still reachable."""
+
+    def spawn_child(self, sid: str, sock: Path) -> int:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={
+                **os.environ,
+                "CLAUDE_CODE_SESSION_ID": sid,
+                "CLAUDE_CODE_MESSAGING_SOCKET": str(sock),
+                "CLAUDE_PROJECT_DIR": "/tmp/live-test",
+            },
+        )
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        for _ in range(200):
+            if self.x.pid_start_time(proc.pid) is not None:
+                break
+            time.sleep(0.01)
+        return proc.pid
+
+    def test_live_scan_finds_a_host_with_no_peer_row(self) -> None:
+        host = self.spawn_target()
+        sock = self.sockdir / f"{host}.sock"
+        sock.touch()
+        sid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        self.spawn_child(sid, sock)
+        found = {row["session_id"]: row for row in self.x.live_claude_sessions()}
+        self.assertIn(sid, found)
+        self.assertEqual(found[sid]["pid"], host)
+        self.assertEqual(found[sid]["cwd"], "/tmp/live-test")
+
+    def test_direct_deliver_uses_the_live_scan_when_peers_is_empty(self) -> None:
+        host = self.spawn_target()
+        sock = self.sockdir / f"{host}.sock"
+        th, got = self.listener(sock)
+        sid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        self.spawn_child(sid, sock)
+        conn = self.x.connect()
+        try:
+            mid = self.queue("idle hello", to=sid)
+            out = self.x.direct_deliver(
+                conn, [mid], [sid], "idle hello", "peer-a", "claude", "sess-a"
+            )
+            th.join(timeout=5)
+            self.assertIn(mid, out)
+            self.assertTrue(out[mid][0], out[mid][1])
+            row = conn.execute(
+                "SELECT delivered_event FROM messages WHERE id = ?", (mid,)
+            ).fetchone()
+            self.assertEqual(row["delivered_event"], "uds-direct")
+        finally:
+            conn.close()
+        self.assertTrue(got, "idle host must receive the json line")
+
+
+class TestRemotePeerPrefix(unittest.TestCase):
+    """`peer:` is a transport prefix, not a session id. SSH is operator-supplied."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="xmsg-remote-"))
+        self.env = dict(os.environ)
+        self.env.pop("XMSG_NO_FAILOPEN", None)
+        for key in (
+            "XMSG_FROM",
+            "XMSG_FROM_TOOL",
+            "XMSG_FROM_SESSION",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDECODE",
+            "XMSG_REMOTE",
+            "XMSG_REMOTE_UP",
+        ):
+            self.env.pop(key, None)
+        self.env["XMSG_DB"] = str(self.tmp / "messages.sqlite3")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_split_peer_target(self) -> None:
+        x = load_impl(self.tmp / "db.sqlite3")
+        self.assertEqual(x.split_peer_target("peer:leaderpc"), "leaderpc")
+        self.assertEqual(x.split_peer_target("peer:"), "all")
+        self.assertEqual(x.split_peer_target("peer"), "all")
+        self.assertEqual(x.split_peer_target("peer:all"), "all")
+        self.assertIsNone(x.split_peer_target("leaderpc"))
+        self.assertIsNone(x.split_peer_target("all"))
+
+    def test_send_runs_one_quoted_command_through_XMSG_REMOTE(self) -> None:
+        stub = self.tmp / "remote"
+        log = self.tmp / "log.txt"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, pathlib\n"
+            f"pathlib.Path({str(log)!r}).write_text("
+            "repr(sys.argv[1:]) + chr(10) + sys.stdin.read())\n"
+        )
+        stub.chmod(0o755)
+        env = dict(
+            self.env,
+            XMSG_REMOTE=str(stub),
+            XMSG_REMOTE_UP="/bin/true",
+            XMSG_FROM_TOOL="claude",
+            XMSG_FROM_SESSION="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+        r = subprocess.run(
+            [sys.executable, str(IMPL), "send", "peer:leaderpc", "hello from here"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        dumped = log.read_text()
+        # One argv token: a shell command, not a list of unquoted words.
+        self.assertIn("xmsg", dumped)
+        self.assertIn("send", dumped)
+        self.assertIn("leaderpc", dumped)
+        self.assertIn("hello from here", dumped)
+        self.assertIn("XMSG_FROM_SESSION=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", dumped)
+
+    def test_missing_remote_is_a_clear_error(self) -> None:
+        env = dict(self.env, PATH="/usr/bin:/bin", XMSG_REMOTE="")
+        env.pop("XMSG_REMOTE", None)
+        # PATH without ~/bin so shutil.which("peer") cannot salvage it.
+        r = subprocess.run(
+            [sys.executable, str(IMPL), "send", "peer:leaderpc", "nope"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("XMSG_REMOTE", r.stderr)
 
 
 if __name__ == "__main__":

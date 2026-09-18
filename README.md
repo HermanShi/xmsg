@@ -205,7 +205,7 @@ clone 到 `~/agent-msg` 以外的路径也行，此时给两个 host 的 hook �
 | `~/agent-msg/bin/xmsg` | 薄 dispatcher，软链进 PATH 后就是命令名 `xmsg` |
 | `~/agent-msg/codex_history.py` | 跨 provider 的只读历史索引与安全恢复选择器 |
 | `~/agent-msg/bin/codex-history` | 选择器命令入口 |
-| `~/agent-msg/tests/test_xmsg.py` | 57 个测试 |
+| `~/agent-msg/tests/test_xmsg.py` | 单元测试（含 idle 直投、`peer:` 远程前缀） |
 | `~/agent-msg/tests/test_codex_history.py` | 选择、恢复防护、只读索引及 Unix WebSocket 协议测试 |
 | `~/.local/share/agent-msg/messages.sqlite3` | 消息队列（本机运行态，不进版本库） |
 
@@ -237,6 +237,9 @@ echo "长内容" | xmsg send 01a04cbe -            # 从 stdin 读正文
 
 xmsg send 01a04cbe "..." --no-direct            # 只排队，不直投（排查用）
 
+xmsg send peer:leaderpc "对面那台的会话"         # 在另一台机器上投递（要配 XMSG_REMOTE）
+xmsg list --peer                               # 列出对面机器上现在能收的会话
+
 xmsg outbox                        # 我发的还有哪些没投出去
 xmsg outbox --all                  # 含已投递 / 已过期
 xmsg cancel 7                      # 撤回一条还没投出去的
@@ -245,8 +248,10 @@ xmsg doctor                        # 配置与队列健康
 
 会话 id 从哪来：`xmsg list`。一个会话在**第一次工具调用**时自动注册成可投递目标，
 带上 cwd、model，以及直投需要的 pid / socket / 权限模式。没跑过任何工具调用的会话
-不会出现在 xmsg peers 里；现在 `list` 还会合并 Codex `session_index.jsonl` 和 Claude
-`custom-title.json`，所以可以按自定义名查找未安装 xmsg hook 的会话。解析顺序固定为：
+不会出现在 xmsg peers 表里；`list` / `send` 还会合并 Codex `session_index.jsonl`、Claude
+`custom-title.json`，以及此刻仍在听 UDS 的 Claude host（`/run/user/.../cc-socks`）。
+所以一个只停在提示符、从没跑过工具调用的会话，现在也能按自定义名找到、也能直投。
+解析顺序固定为：
 完整 session id → 精确自定义名 → id 前缀。自定义名有多个历史/活跃候选时会拒绝发送并列出
 完整 id，避免“leader”之类常见名称误投。
 
@@ -495,6 +500,33 @@ label 伪造不了 session）、清理 9 例（保留窗口内外、只收不发
 | `XMSG_FROM` | — | 发送方 label（只是显示名，伪造不了署名） |
 | `XMSG_FROM_TOOL` / `XMSG_FROM_SESSION` | — | 真正的署名字段；不设 `_SESSION` 即为 `unattributed` |
 | `XMSG_NO_FAILOPEN` | — | `=1` 关掉全部兜底，仅用于反证 |
+| `XMSG_REMOTE` | `peer`（若在 PATH） | 在另一台机器上执行一条命令。xmsg **不附带** SSH 助手；这是操作者自己的包装（`ssh otherhost`、ControlMaster 封装，等等）。`peer:` 前缀和 `xmsg list --peer` 走这条 |
+| `XMSG_REMOTE_UP` | `peer-up`（若在 PATH） | 发送前可选的开通道命令；失败被忽略 |
+| `XMSG_REMOTE_TIMEOUT` | 25 | 对面 `xmsg send/list` 的超时（秒） |
+
+## 跨机器：`peer:` 前缀
+
+xmsg 的队列和 UDS 都是**本机**的。要投到另一台机器上的会话，把目标写成 `peer:<会话>`：
+本机 `xmsg send` 通过 `XMSG_REMOTE` 在对面再跑一次 `xmsg send`，对面用它自己的 sqlite 和 socket 投递。
+
+```
+xmsg send peer:leaderpc "把 #163 的结论同步给我"
+xmsg send peer:all "所有人对面停一下"
+xmsg list --peer
+```
+
+`XMSG_REMOTE` 是「把一条命令丢到对面去跑」的包装，**本仓库不提供这个包装**。可以是：
+
+```bash
+export XMSG_REMOTE="ssh otherhost"
+# 或任何 exec 远程 argv 的脚本，例如本机 ~/bin/peer
+```
+
+OpenSSH 会把多余参数用空格拼成远程 shell 字符串，所以 xmsg 发给 `XMSG_REMOTE` 的是**一条已经 quote 过的命令**，不是拆开的 argv。
+
+没配 `XMSG_REMOTE`、PATH 上也没有 `peer` 时，`peer:` 会立刻报错，不会静默投到本机。
+
+跨机器时 `from-mode` **不会**自动带上：那个值只从**接收方机器**的 peers 表读出发送方的 `permission_mode`，而对面没有你这边的 session 行。bypass 接收方会把消息 hold 住等人点 Deliver。对面若配了 `crossSessionInbound: accept`（两台这边已经是），则直接放行。不要在发送方伪造 `from-mode`。
 
 ## Hook 配置
 

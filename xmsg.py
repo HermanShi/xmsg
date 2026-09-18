@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -315,6 +316,26 @@ def discover_sessions(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         except OSError:
             pass
 
+    for item in live_claude_sessions():
+        sid = str(item.get("session_id") or "")
+        if not sid:
+            continue
+        record = by_id.setdefault(sid, dict(item))
+        for key in ("pid", "pid_start", "sock_path", "tool", "cwd"):
+            value = item.get(key)
+            if value not in (None, ""):
+                record[key] = value
+        # Keep an existing xmsg peer row as the source of permission_mode;
+        # still mark that a live host is listening.
+        if record.get("source") != "xmsg":
+            record["source"] = "live-claude"
+        record["last_seen_at"] = max(
+            int(record.get("last_seen_at") or 0), int(item.get("last_seen_at") or 0)
+        )
+        record["updated_at"] = max(
+            int(record.get("updated_at") or 0), int(item.get("updated_at") or 0)
+        )
+
     return list(by_id.values())
 
 
@@ -383,6 +404,86 @@ def _record_is_live(row: dict[str, Any]) -> bool:
     return bool(seen and seen >= now() - PEER_STALE_SECONDS)
 
 
+
+def _parse_env_bytes(data: bytes) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in data.split(b"\0"):
+        if not item or b"=" not in item:
+            continue
+        key, _, value = item.partition(b"=")
+        try:
+            out[key.decode()] = value.decode("utf-8", "replace")
+        except UnicodeDecodeError:
+            continue
+    return out
+
+
+def live_claude_sessions() -> list[dict[str, Any]]:
+    """Claude hosts listening right now, even if they have never run an xmsg hook.
+
+    The host process often has no CLAUDE_CODE_SESSION_ID in its own environ.
+    Children do, and they point CLAUDE_CODE_MESSAGING_SOCKET at `{pid}.sock`.
+    """
+    socks: dict[int, dict[str, Any]] = {}
+    for directory in SOCK_DIRS:
+        try:
+            found = directory.glob("*.sock")
+        except OSError:
+            continue
+        for sock in found:
+            try:
+                pid = int(sock.stem)
+            except ValueError:
+                continue
+            start = pid_start_time(pid)
+            if start is None:
+                continue
+            socks[pid] = {
+                "pid": pid,
+                "pid_start": start,
+                "sock_path": str(sock),
+                "tool": "claude",
+                "source": "live-claude",
+            }
+    if not socks:
+        return []
+    by_sid: dict[str, dict[str, Any]] = {}
+    try:
+        procs = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    for proc in procs:
+        if not proc.name.isdigit():
+            continue
+        try:
+            data = (proc / "environ").read_bytes()
+        except OSError:
+            continue
+        if b"CLAUDE_CODE_SESSION_ID=" not in data:
+            continue
+        env = _parse_env_bytes(data)
+        sid = env.get("CLAUDE_CODE_SESSION_ID") or ""
+        sock = env.get("CLAUDE_CODE_MESSAGING_SOCKET") or ""
+        if not sid or not sock:
+            continue
+        try:
+            host_pid = int(Path(sock).stem)
+        except ValueError:
+            continue
+        info = socks.get(host_pid)
+        if info is None:
+            continue
+        rec = dict(info)
+        rec["session_id"] = sid
+        rec["cwd"] = env.get("CLAUDE_PROJECT_DIR") or env.get("PWD") or ""
+        rec["last_seen_at"] = now()
+        rec["updated_at"] = rec["last_seen_at"]
+        rec["label"] = rec.get("label") or ""
+        rec["queued"] = 0
+        by_sid[sid] = rec
+    return list(by_sid.values())
+
+
 # --------------------------------------------------------------------------
 # addressing
 # --------------------------------------------------------------------------
@@ -394,14 +495,16 @@ def resolve_target(conn: sqlite3.Connection, spec: str, *, allow_unknown: bool) 
     is reported instead of silently sending to the wrong session.
     """
     spec = spec.strip()
+    if spec.lower().startswith("peer:"):
+        raise SystemExit("xmsg: internal error: peer: prefix leaked into resolve_target")
     if spec == "all":
-        rows = conn.execute(
-            "SELECT session_id FROM peers WHERE last_seen_at >= ? ORDER BY last_seen_at DESC",
-            (now() - PEER_STALE_SECONDS,),
-        ).fetchall()
+        # Include idle Claude hosts that have never registered an xmsg peer
+        # row — they still have a live socket, and "all" should mean all
+        # reachable sessions, not only ones that have already called a tool.
+        rows = [r for r in discover_sessions(conn) if _record_is_live(r)]
         if not rows:
             raise SystemExit("xmsg: no live sessions to broadcast to (try `xmsg list --all`)")
-        return [r["session_id"] for r in rows]
+        return [str(r["session_id"]) for r in rows]
 
     discovered = discover_sessions(conn)
     exact = [row for row in discovered if row["session_id"] == spec]
@@ -776,7 +879,11 @@ def default_sender_label() -> tuple[str, str, str]:
     by passing a prettier string.
     """
     tool = os.environ.get("XMSG_FROM_TOOL", "")
-    session = os.environ.get("XMSG_FROM_SESSION", "")
+    session = os.environ.get("XMSG_FROM_SESSION", "") or os.environ.get(
+        "CLAUDE_CODE_SESSION_ID", ""
+    )
+    if not tool and os.environ.get("CLAUDECODE"):
+        tool = "claude"
     label = os.environ.get("XMSG_FROM", "")
     if not label:
         if tool and session:
@@ -813,6 +920,127 @@ def sender_origin(from_label: str, from_tool: str, from_session: str) -> str:
     return f"{from_label} (CLI on this host, no session id — unattributed)"
 
 
+
+def remote_runner() -> list[str]:
+    """Argv of the operator-supplied command that runs a command on the other host.
+
+    xmsg does not ship an SSH helper. `XMSG_REMOTE` is that helper: anything
+    that takes a remote argv and execs it over there (`ssh other`, a
+    ControlMaster wrapper, …). If unset, a `peer` binary on PATH is used when
+    present — that is an operator convention, not part of this repo.
+    """
+    raw = os.environ.get("XMSG_REMOTE", "").strip()
+    if not raw:
+        found = shutil.which("peer")
+        if not found:
+            raise SystemExit(
+                "xmsg: peer: targets need XMSG_REMOTE (a command that runs argv "
+                "on the other machine), or a `peer` binary on PATH"
+            )
+        raw = found
+    return shlex.split(raw)
+
+
+def remote_up_runner() -> list[str] | None:
+    raw = os.environ.get("XMSG_REMOTE_UP", "").strip()
+    if raw:
+        return shlex.split(raw)
+    found = shutil.which("peer-up")
+    return [found] if found else None
+
+
+REMOTE_XMSG_TIMEOUT = float(os.environ.get("XMSG_REMOTE_TIMEOUT", os.environ.get("XMSG_PEER_TIMEOUT", "25")))
+
+
+def split_peer_target(spec: str) -> str | None:
+    """Strip a `peer:` host prefix. `peer:` and `peer:all` mean `all` on the other box."""
+    spec = spec.strip()
+    if spec == "peer" or spec.lower().startswith("peer:"):
+        rest = spec.split(":", 1)[1].strip() if ":" in spec else ""
+        return rest or "all"
+    return None
+
+
+def _remote_exec(args: list[str], *, stdin: str = "", timeout: float = REMOTE_XMSG_TIMEOUT) -> subprocess.CompletedProcess:
+    """Run argv on the other machine through XMSG_REMOTE. Raises SystemExit on transport failure."""
+    runner = remote_runner()
+    # OpenSSH joins extra argv with spaces and the remote shell re-parses the
+    # result. One already-quoted command string is the only shape that survives
+    # both that join and a wrapper which execs ssh with "$@".
+    command = " ".join(shlex.quote(a) for a in args)
+    try:
+        return subprocess.run(
+            [*runner, command],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(f"xmsg: cannot run XMSG_REMOTE {runner!r}: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(f"xmsg: remote xmsg timed out after {timeout:.0f}s") from exc
+
+
+def ensure_remote_channel() -> None:
+    """Best-effort: run XMSG_REMOTE_UP / `peer-up` so the runner has a live channel."""
+    up = remote_up_runner()
+    if not up:
+        return
+    try:
+        subprocess.run(up, capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+
+
+def send_to_peer(spec: str, body: str, args: argparse.Namespace) -> int:
+    """Run `xmsg send` on the other machine so delivery uses its UDS / sqlite."""
+    ensure_remote_channel()
+    label, tool, session = default_sender_label()
+    if args.from_label:
+        label = args.from_label
+    remote = ["env", f"XMSG_FROM={label}"]
+    if tool:
+        remote.append(f"XMSG_FROM_TOOL={tool}")
+    if session:
+        remote.append(f"XMSG_FROM_SESSION={session}")
+    remote.extend(["xmsg", "send", spec, "-"])
+    if args.force:
+        remote.append("--force")
+    if args.no_direct:
+        remote.append("--no-direct")
+    if args.urgent:
+        remote.append("--urgent")
+    elif getattr(args, "priority", None) not in (None, DEFAULT_MESSAGE_PRIORITY):
+        remote.extend(["--priority", str(args.priority)])
+    if args.ttl is not None:
+        remote.extend(["--ttl", str(args.ttl)])
+    proc = _remote_exec(remote, stdin=body + "\n")
+    if proc.stdout:
+        sys.stdout.write(proc.stdout if proc.stdout.endswith("\n") else proc.stdout + "\n")
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    if proc.returncode != 0:
+        raise SystemExit("xmsg: remote send failed (is XMSG_REMOTE reachable?)")
+    return 0
+
+
+def list_peer(args: argparse.Namespace) -> int:
+    ensure_remote_channel()
+    remote = ["xmsg", "list"]
+    if args.all:
+        remote.append("--all")
+    if args.json:
+        remote.append("--json")
+    proc = _remote_exec(remote)
+    if proc.returncode != 0:
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+        raise SystemExit("xmsg: remote list failed (is XMSG_REMOTE reachable?)")
+    sys.stdout.write(proc.stdout)
+    return 0
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     body = args.text
     if body == "-" or (not body and not sys.stdin.isatty()):
@@ -822,6 +1050,10 @@ def cmd_send(args: argparse.Namespace) -> int:
         raise SystemExit("xmsg: refusing to send an empty message")
     if len(body) > MAX_BODY_CHARS:
         raise SystemExit(f"xmsg: message is {len(body)} chars, limit is {MAX_BODY_CHARS}")
+
+    remote_spec = split_peer_target(args.to)
+    if remote_spec is not None:
+        return send_to_peer(remote_spec, body, args)
 
     conn = connect()
     try:
@@ -910,7 +1142,17 @@ def direct_deliver(
             (target,),
         ).fetchone()
         if row is None:
-            continue
+            # Idle Claude hosts never register a peer row until the first tool
+            # call. live_claude_sessions still has their socket, and that is
+            # enough to hand the bytes over — leaving the row queued would
+            # wait for a hook that an idle session will never run.
+            live = next(
+                (item for item in live_claude_sessions() if item.get("session_id") == target),
+                None,
+            )
+            if live is None:
+                continue
+            row = live
         tool = str(row["tool"] or "")
         if tool == "codex":
             # Codex renders an incoming message as user input, so the framing that
@@ -974,6 +1216,8 @@ def sender_claimed_mode(conn: sqlite3.Connection, from_session: str) -> str:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    if getattr(args, "peer", False):
+        return list_peer(args)
     conn = connect()
     try:
         cutoff = 0 if args.all else now() - PEER_STALE_SECONDS
@@ -1485,7 +1729,10 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("send", help="queue a message for a session")
-    s.add_argument("to", help="session id, unique prefix, or 'all'")
+    s.add_argument(
+        "to",
+        help="session id, unique prefix, 'all', or 'peer:<same>' for the other machine",
+    )
     s.add_argument("text", nargs="?", default="", help="message body ('-' or omit to read stdin)")
     s.add_argument("--from", dest="from_label", default="", help="override the sender label")
     s.add_argument("--ttl", type=int, default=None, help=f"seconds before giving up (default {DEFAULT_TTL_SECONDS})")
@@ -1525,6 +1772,7 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("list", help="list sessions available as delivery targets")
     s.add_argument("--all", action="store_true", help="include sessions that have gone quiet")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--peer", action="store_true", help="list sessions on the other machine")
     s.set_defaults(fn=cmd_list)
 
     s = sub.add_parser("outbox", help="show queued / recently delivered messages")
