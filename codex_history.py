@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-provider Codex history picker. Listing never resumes or repairs threads."""
+"""Cross-provider Codex history picker and text handoff exporter."""
 
 from __future__ import annotations
 
@@ -42,6 +42,111 @@ REQUIRED_FIELDS = {"id", "model_provider", "cwd", "updated_at", "archived", "sou
 def clean(value: Any) -> str:
     """One display line, with no terminal escapes, bidi controls, or tab fields."""
     return "".join(" " if unicodedata.category(c).startswith("C") else c for c in str(value or ""))
+
+
+def _content_text(content: Any) -> str:
+    """Extract human-visible text without carrying Responses API IDs forward."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+        elif isinstance(item.get("input_text"), str):
+            parts.append(item["input_text"])
+    return "\n".join(parts)
+
+
+def _clip(text: str, limit: int | None) -> str:
+    if limit is None or len(text) <= limit:
+        return text
+    return text[:limit] + f"\n\n[… 已截断，原长度 {len(text)} 字符 …]"
+
+
+def _json_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def export_transcript(row: dict[str, Any], home: Path, *, full: bool = False) -> str:
+    """Render a rollout as provider-neutral Markdown for a new session.
+
+    Only visible conversation/tool data is exported. IDs, internal metadata and
+    encrypted reasoning are deliberately not copied because another provider
+    cannot replay them as Responses API items.
+    """
+    rollout = row.get("rollout_path")
+    if not rollout:
+        raise HistoryError("历史缺少 rollout 文件，无法导出上下文。")
+    path = Path(str(rollout)).expanduser()
+    try:
+        path = path.resolve()
+        path.relative_to(home.resolve())
+    except ValueError:
+        raise HistoryError("rollout 文件不在 CODEX_HOME 下，拒绝导出。") from None
+    if not path.is_file():
+        raise HistoryError("找不到该会话的 rollout 文件，无法导出上下文。")
+
+    clip_limit = None if full else 8000
+    blocks: list[str] = []
+    skipped = 0
+    with path.open(encoding="utf-8") as stream:
+        for line_no, line in enumerate(stream, 1):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            item = record.get("payload") if isinstance(record, dict) else None
+            if not isinstance(item, dict) or record.get("type") != "response_item":
+                continue
+            item_type = item.get("type")
+            if item_type == "message":
+                role = item.get("role")
+                text = _content_text(item.get("content"))
+                # Developer/system prompts contain local policy and provider
+                # wiring; they are not portable conversation context.
+                if role not in ("user", "assistant") or not text.strip():
+                    continue
+                blocks.append(f"## {'用户' if role == 'user' else '助手'}\n\n{text.strip()}\n")
+            elif item_type in ("function_call", "custom_tool_call"):
+                name = item.get("name") or "tool"
+                arguments = item.get("arguments", item.get("input", ""))
+                blocks.append(f"### 工具调用：`{clean(name)}`\n\n```text\n{_clip(_json_text(arguments), clip_limit)}\n```\n")
+            elif item_type in ("function_call_output", "custom_tool_call_output"):
+                output = _json_text(item.get("output", ""))
+                blocks.append(f"### 工具结果\n\n```text\n{_clip(output, clip_limit)}\n```\n")
+            elif full and item_type == "reasoning":
+                summaries = item.get("summary") or item.get("summary_text") or []
+                text = _content_text(summaries) if isinstance(summaries, list) else str(summaries)
+                if text.strip():
+                    blocks.append(f"### 助手思路摘要（非原始 reasoning）\n\n{text.strip()}\n")
+            else:
+                skipped += 1
+
+    if not blocks:
+        raise HistoryError("rollout 中没有可导出的用户/助手文本。")
+    title = clean(row.get("name") or row.get("title") or "Codex 会话")
+    header = (f"# Codex 上下文导出：{title}\n\n"
+              f"- 会话：`{row['id']}`\n"
+              f"- 原 provider/model：`{clean(row.get('model_provider'))}/{clean(row.get('model'))}`\n"
+              f"- 工作目录：`{clean(row.get('cwd'))}`\n"
+              f"\n> 这是 provider-neutral 的文本上下文，不是原生 resume。请基于以下记录继续工作；"
+              f"不要尝试重放旧工具调用或使用旧消息 ID。\n\n")
+    if not full:
+        header += "> 默认模式省略了内部 metadata、加密 reasoning，并截断了过长工具输出。\n\n"
+    if skipped:
+        header += f"> 另有 {skipped} 条不可移植的内部记录未导出。\n\n"
+    return header + "\n".join(blocks).rstrip() + "\n"
 
 
 def read_sqlite(home: Path) -> list[dict[str, Any]]:
@@ -450,6 +555,11 @@ def parser() -> argparse.ArgumentParser:
     resume.add_argument("--cd", help="覆盖已不存在或不适用的工作目录")
     resume.add_argument("--no-fzf", action="store_true")
     resume.add_argument("--dry-run", action="store_true", help="只输出 argv，不启动 Codex")
+    export = commands.add_parser("export", parents=[common], help="把历史会话导出为 provider-neutral Markdown")
+    export.add_argument("target", nargs="?", help="完整 UUID、自定义名或唯一 ID 前缀")
+    export.add_argument("--full", action="store_true", help="保留完整工具输出和思路摘要；仍不导出加密 reasoning")
+    export.add_argument("--output", type=Path, help="输出文件；省略时写 stdout")
+    export.add_argument("--no-fzf", action="store_true")
     return root
 
 
@@ -470,6 +580,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         row = resolve_thread(rows, args.target) if args.target else choose_thread(rows, not args.no_fzf)
         if row is None:
+            return 0
+        if args.command == "export":
+            text = export_transcript(row, home, full=args.full)
+            if args.output:
+                output = args.output.expanduser().resolve()
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(text, encoding="utf-8", newline="\n")
+                print(f"已导出到 {output}")
+            else:
+                print(text, end="")
             return 0
         command = resume_command(row, args, home)
         switching = bool(args.switch_provider and args.switch_provider != row.get("model_provider"))

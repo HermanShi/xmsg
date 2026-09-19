@@ -228,6 +228,8 @@ codex-history list --provider tianzhi --query 编排
 codex-history list --include-archived
 codex-history resume               # fzf（没有 fzf 时为编号选择）
 codex-history resume <完整 UUID> --dry-run
+codex-history export <完整 UUID> --output /tmp/context.md
+codex-history export <完整 UUID> --full --output /tmp/context-full.md
 
 xmsg send 01a04cbe "把 #163 的结论同步给我"     # 全 id 或 >=4 字符的唯一前缀
 xmsg send leader "请优先看这个"                 # 自定义名；完整 session id 优先
@@ -307,6 +309,19 @@ codex-history resume <UUID> --switch-provider tianzhi --model <model>
 这会明确提示「历史上下文将发送给新 provider」。历史实际上共存在同一个 Codex home，
 本工具不改写旧记录的 provider 来伪装统一；显式跨 provider 恢复后的新轮次仍由 Codex 持久化。
 `--dry-run` 只预览命令，不启动 Codex，也不向 provider 发送任何历史。
+
+跨 provider 的原生 `resume` 可能因旧 rollout 中的 provider 专属 Responses item ID
+（例如 `at_...`）被新 provider 拒绝。需要把上下文交给另一模型时，使用 `export`：
+
+```bash
+codex-history export <UUID> --output /tmp/codex-context.md
+# 然后在新的 GPT 会话中让它读取该文件并继续
+```
+
+导出是 provider-neutral Markdown：保留用户/助手文本、工具调用和工具结果，但不复制
+消息 ID、内部 metadata 或加密 reasoning，因此不会让新 provider 重放旧的 Responses 链。
+默认模式会截断过长工具输出；`--full` 保留完整工具输出和可见的思路摘要（仍不导出加密
+reasoning）。它是上下文交接，不是原生 resume；旧审批、队列和运行中的工具不会迁移。
 
 `send` 的输出会说清走了哪条路：
 

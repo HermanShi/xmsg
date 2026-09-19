@@ -150,6 +150,50 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(argv, ["codex", "resume", SID_A, "-c", 'model_provider="original"',
                                 "--model", "model-a", "--cd", str(self.workspace)])
 
+    def test_export_transcript_is_provider_neutral_and_excludes_ids(self):
+        rollout = self.home / "sessions" / "rollout.jsonl"
+        rollout.parent.mkdir()
+        records = [
+            {"type": "response_item", "payload": {"type": "message", "id": "msg_old",
+             "role": "developer", "content": [{"type": "input_text", "text": "secret wiring"}]}},
+            {"type": "response_item", "payload": {"type": "message", "id": "msg_user",
+             "role": "user", "content": [{"type": "input_text", "text": "继续处理"}]}},
+            {"type": "response_item", "payload": {"type": "function_call", "id": "at_old",
+             "name": "exec", "arguments": "{\"cmd\":\"pwd\"}"}},
+            {"type": "response_item", "payload": {"type": "function_call_output", "id": "fco_old",
+             "output": "结果"}},
+            {"type": "response_item", "payload": {"type": "reasoning", "id": "rs_old",
+             "encrypted_content": "DO NOT COPY", "summary": [{"type": "summary_text", "text": "思路"}]}},
+            {"type": "response_item", "payload": {"type": "message", "id": "msg_assistant",
+             "role": "assistant", "content": [{"type": "output_text", "text": "已完成"}]}},
+        ]
+        rollout.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in records) + "\n")
+        row = {**self.row, "rollout_path": str(rollout)}
+        text = history.export_transcript(row, self.home)
+        self.assertIn("继续处理", text)
+        self.assertIn("已完成", text)
+        self.assertIn("工具调用", text)
+        self.assertNotIn("secret wiring", text)
+        self.assertNotIn("DO NOT COPY", text)
+        self.assertNotIn("at_old", text)
+
+    def test_export_full_keeps_reasoning_summary_and_cli_writes_file(self):
+        rollout = self.home / "rollout.jsonl"
+        rollout.write_text(json.dumps({"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": "你好"}]}}) + "\n" +
+            json.dumps({"type": "response_item", "payload": {"type": "reasoning", "summary": [
+                {"type": "summary_text", "text": "思路摘要"}]}}) + "\n")
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE threads SET rollout_path=? WHERE id=?", (str(rollout), SID_A))
+        output = self.home / "out.md"
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = history.main(["export", SID_A, "--home", str(self.home), "--backend", "sqlite",
+                               "--full", "--output", str(output)])
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(output.is_file())
+        self.assertIn("思路摘要", output.read_text())
+
     def test_provider_filter_is_not_a_switch(self):
         argv = history.resume_command(self.row, self.args("--provider", "other"), self.home)
         self.assertIn('model_provider="original"', argv)
