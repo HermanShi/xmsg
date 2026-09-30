@@ -607,8 +607,15 @@ def envelope(body: str, *, label: str, from_session: str, from_mode: str) -> str
     Attributes are emitted in the host's own order and dropped individually when
     they would not survive its validation, because a rejected envelope is not a
     rejected attribute -- it degrades the whole message back to unattributed.
+
+    A name the host's character class would reject (any non-ASCII title, which
+    both hosts allow) falls back to the session's id prefix rather than being
+    dropped: `from` is the address the receiver types to answer, and no address
+    at all is worse than a less readable one. The full name stays in the outbox.
     """
     attrs = []
+    if not (label and _LABEL_RE.match(label)) and from_session and _SESSION_RE.match(from_session):
+        label = from_session[:8]
     if label and _LABEL_RE.match(label):
         attrs.append(f'from="{label}"')
     if from_session and _SESSION_RE.match(from_session):
@@ -974,16 +981,57 @@ def sweep_if_due(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def local_session_name(tool: str, session: str) -> str:
+    """The sender's own name, as its host's local index records it.
+
+    This is the same string `xmsg send <name>` resolves, which is the whole
+    reason it belongs in the envelope's `from`: the receiver replies by copying
+    that attribute back into a target. Read at send time rather than cached,
+    because a session can be renamed at any point in its life.
+    """
+    if not session or not _SESSION_RE.match(session):
+        # Also keeps a glob metacharacter out of the title lookup below.
+        return ""
+    if tool == "claude":
+        try:
+            paths = sorted(CLAUDE_PROJECTS.glob(f"*/{session}/custom-title.json"))
+        except OSError:
+            return ""
+        for path in paths:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            name = str(value.get("customTitle") or "").strip() if isinstance(value, dict) else ""
+            if name:
+                return name
+        return ""
+    if tool == "codex":
+        # One index row per rename; the last occurrence is the current name.
+        name = ""
+        for item in _jsonl_records(CODEX_SESSION_INDEX):
+            if str(item.get("id") or "") == session:
+                name = str(item.get("thread_name") or "").strip() or name
+        return name
+    return ""
+
+
 def default_sender_label() -> tuple[str, str, str]:
     """(label, tool, session) for whoever is running `xmsg send`.
 
     An agent sending on its own behalf can identify itself via XMSG_FROM /
     XMSG_FROM_TOOL / XMSG_FROM_SESSION; a human at a shell gets user@host.
 
+    With no XMSG_FROM the label is the sender's own session name, falling back
+    to its id prefix -- both of which `resolve_target` accepts, so the receiver
+    can answer whatever it was told. A `tool:id` composite resolves to nothing
+    and is never produced here.
+
     ``--from`` and ``XMSG_FROM`` set only the *label*, never tool/session. The
-    label is decoration; ``from_tool``/``from_session`` are what the receiver's
-    framing calls attributed, so a sender cannot claim to be a session it is not
-    by passing a prettier string.
+    label is an address the receiver can type back, not an attestation;
+    ``from_tool``/``from_session`` are what the receiver's framing calls
+    attributed, so a sender cannot claim to be a session it is not by passing a
+    prettier string.
     """
     tool = os.environ.get("XMSG_FROM_TOOL", "")
     codex_session = os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or ""
@@ -1004,8 +1052,10 @@ def default_sender_label() -> tuple[str, str, str]:
     )
     label = os.environ.get("XMSG_FROM", "")
     if not label:
+        label = local_session_name(tool, session)
+    if not label:
         if tool and session:
-            label = f"{tool}:{session[:8]}"
+            label = session[:8]
         elif tool:
             label = tool
         else:
@@ -1318,10 +1368,12 @@ def _deliver_one(
             row, rendered, to_session=target, from_session=from_session, from_tool=from_tool, native_body=body,
         )
     mode = sender_claimed_mode(conn, from_session)
-    # Claude renders its own source header from this native envelope label.
-    # Keep the transport payload bare while retaining cross-tool provenance.
-    if from_tool in ("claude", "codex", "notification") and not label.startswith(from_tool + ":"):
-        label = f"{from_tool}:{label}"
+    # Claude renders its own source header from this native envelope label, and a
+    # receiver answers by copying that string back into a target. So it carries
+    # the sender's name alone: a `tool:label` composite resolves to no session,
+    # which is what made replies to xmsg unanswerable. Which tool sent it stays
+    # available from `from-session` and the outbox, neither of which is an
+    # address the receiver has to retype.
     return direct_send(row, body, label=label, from_session=from_session, from_mode=mode)
 
 
@@ -1838,7 +1890,9 @@ def main(argv: list[str] | None = None) -> int:
         help="session id, unique prefix, 'all', or 'peer:<same>' for the other machine",
     )
     s.add_argument("text", nargs="?", default="", help="message body ('-' or omit to read stdin)")
-    s.add_argument("--from", dest="from_label", default="", help="override the sender label")
+    s.add_argument("--from", dest="from_label", default="",
+                   help="override the sender label (the address the receiver replies to; "
+                        "defaults to this session's own name)")
     s.add_argument(
         "--notification", action="store_true",
         help="declare a local automated reminder, without inheriting agent identity or adding authority (local targets only)",

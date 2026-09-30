@@ -79,6 +79,12 @@ class Base(unittest.TestCase):
         self.sockdir.mkdir()
         self.x.SOCK_DIRS = [self.sockdir]
         self.x.CODEX_HOME = self.tmp / "codex"
+        # Both name indexes are module constants resolved at import, so pointing
+        # CODEX_HOME at tmp does not move them. local_session_name() reads them
+        # on every send, and a test left on the real ones would answer from this
+        # machine's own session titles.
+        self.x.CODEX_SESSION_INDEX = self.tmp / "codex" / "session_index.jsonl"
+        self.x.CLAUDE_PROJECTS = self.tmp / "claude-projects"
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -403,6 +409,108 @@ class TestPeerRegistry(Base):
         finally:
             conn.close()
 
+    # The label the sender puts in `from` is the string the receiver retypes to
+    # answer. Nothing checked that it resolves back, which is how `claude:<id>`
+    # -- resolvable by none of the three rules -- survived into delivery. These
+    # close the loop: they fail if the sender ever emits an unaddressable label.
+    def _titled_claude_session(self, sid: str, name: str) -> None:
+        title = self.tmp / "titles" / "project" / sid / "custom-title.json"
+        title.parent.mkdir(parents=True, exist_ok=True)
+        title.write_text(json.dumps({"customTitle": name}), encoding="utf-8")
+        self.x.CLAUDE_PROJECTS = title.parents[2]
+
+    def _round_trip(self, label: str, sid: str) -> None:
+        conn = self.x.connect()
+        try:
+            self.assertEqual(self.x.resolve_target(conn, label, allow_unknown=False), [sid])
+        finally:
+            conn.close()
+
+    def test_claude_sender_label_resolves_back_to_the_sending_session(self) -> None:
+        sid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        self._titled_claude_session(sid, "leader-x")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=True):
+            label, tool, session = self.x.default_sender_label()
+        self.assertEqual((label, tool, session), ("leader-x", "claude", sid))
+        self._round_trip(label, sid)
+
+    def test_codex_sender_label_resolves_back_to_the_sending_thread(self) -> None:
+        sid = "codex-thread-1"
+        index = self.tmp / "codex-index.jsonl"
+        index.write_text(
+            '{"id":"codex-thread-1","thread_name":"old-name","updated_at":"2026-09-12T00:00:00Z"}\n'
+            '{"id":"codex-thread-1","thread_name":"new-name","updated_at":"2026-09-13T00:00:00Z"}\n',
+            encoding="utf-8",
+        )
+        self.x.CODEX_SESSION_INDEX = index
+        with mock.patch.dict(os.environ, {"CODEX_SESSION_ID": sid}, clear=True):
+            label, _, _ = self.x.default_sender_label()
+        # Last occurrence wins, same as the resume picker and discover_sessions.
+        self.assertEqual(label, "new-name")
+        self._round_trip(label, sid)
+
+    def test_unnamed_sender_falls_back_to_a_resolvable_id_prefix(self) -> None:
+        self.hook()
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.sid}, clear=True):
+            label, _, _ = self.x.default_sender_label()
+        self.assertEqual(label, self.sid[:8])
+        self._round_trip(label, self.sid)
+
+    def test_the_label_that_reaches_the_wire_is_still_an_address(self) -> None:
+        """Asserts on the value delivery actually emits, not on the helper.
+
+        `_deliver_one` used to prepend the sending tool *after*
+        `default_sender_label` had produced a good name, so a correct label was
+        never what went out. A test that stops at the helper cannot see that, so
+        this one follows the same string through delivery into the envelope and
+        back through resolution.
+        """
+        sid = "bbbbcccc-dddd-4eee-8fff-aaaabbbbcccc"
+        self._titled_claude_session(sid, "leader-z")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=True):
+            label, tool, session = self.x.default_sender_label()
+        conn = self.x.connect()
+        try:
+            with mock.patch.object(self.x, "direct_send", return_value=(True, "ok")) as direct:
+                self.x._deliver_one(conn, {"tool": "claude"}, 1, "target", "body", label, tool, session)
+            sent = direct.call_args.kwargs["label"]
+            self.assertIn(f'from="{sent}"', self.x.envelope("body", label=sent, from_session=session, from_mode="bypass"))
+            self.assertEqual(self.x.resolve_target(conn, sent, allow_unknown=False), [sid])
+        finally:
+            conn.close()
+
+    def test_a_tool_prefixed_label_is_unaddressable(self) -> None:
+        """The regression itself: pin that the old shape resolves to nothing.
+
+        Without this the fix could be reverted and every other test would stay
+        green, because they all assert on strings rather than on addressability.
+        """
+        sid = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        self._titled_claude_session(sid, "leader-y")
+        conn = self.x.connect()
+        try:
+            for bad in (f"claude:{sid[:8]}", "claude:leader-y"):
+                with self.subTest(label=bad), self.assertRaises(SystemExit):
+                    self.x.resolve_target(conn, bad, allow_unknown=False)
+        finally:
+            conn.close()
+
+    def test_non_ascii_session_name_still_reaches_the_receiver_as_an_address(self) -> None:
+        """A Chinese title is legal on both hosts but outside the attribute class.
+
+        End to end: the sender keeps the readable name for its own records while
+        the envelope carries the id prefix, so the receiver still has something
+        it can answer instead of an unattributed message.
+        """
+        sid = "abcdefab-cdef-4bcd-8bcd-efabcdefabcd"
+        self._titled_claude_session(sid, "审查-会话")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid}, clear=True):
+            label, _, session = self.x.default_sender_label()
+        self.assertEqual(label, "审查-会话")
+        env = self.x.envelope("hi", label=label, from_session=session, from_mode="bypass")
+        self.assertIn(f'from="{sid[:8]}"', env)
+        self._round_trip(sid[:8], sid)
+
     def test_codex_session_index_is_discoverable_by_name(self) -> None:
         index = self.tmp / "session_index.jsonl"
         index.write_text('{"id":"codex-session","thread_name":"codex-target","updated_at":"2026-09-12T00:00:00Z"}\n')
@@ -707,10 +815,17 @@ class TestEnvelope(Base):
         self.assertNotIn("from-session", env)
         self.assertIn('from="peer-a"', env)
 
-    def test_label_outside_the_class_is_dropped(self) -> None:
+    def test_label_outside_the_class_falls_back_to_the_session_id(self) -> None:
+        # A non-ASCII session title is legal on both hosts but outside this
+        # attribute's class. Dropping `from` entirely would leave the receiver
+        # with no address to answer, so it degrades to the id prefix instead.
         env = self.x.envelope("hi", label="péer a", from_session="sess-a", from_mode="bypass")
-        self.assertNotIn("from=", env.split(">")[0].replace("from-session", ""))
+        self.assertIn('from="sess-a"', env)
         self.assertIn('from-session="sess-a"', env)
+
+    def test_unusable_label_is_dropped_when_no_session_can_replace_it(self) -> None:
+        env = self.x.envelope("hi", label="péer a", from_session="", from_mode="bypass")
+        self.assertNotIn("from=", env)
 
     def test_unknown_mode_is_not_claimed(self) -> None:
         env = self.x.envelope("hi", label="p", from_session="s", from_mode="whatever")

@@ -133,8 +133,11 @@ class DeliveryReservationTests(Base):
         return conn
 
     def test_codex_sender_is_automatically_attributed(self):
+        # No name in the index here, so the label degrades to the id prefix --
+        # which `xmsg send` still resolves. It is never `tool:id`, which resolves
+        # to nothing and left the receiver unable to answer.
         with mock.patch.dict(os.environ, {"CODEX_SESSION_ID": "my-thread"}, clear=True):
-            self.assertEqual(self.x.default_sender_label(), ("codex:my-threa", "codex", "my-thread"))
+            self.assertEqual(self.x.default_sender_label(), ("my-threa", "codex", "my-thread"))
 
     def test_native_route_receives_body_separately_from_thin_fallback(self):
         with contextlib.closing(self.x.connect()) as conn:
@@ -144,12 +147,15 @@ class DeliveryReservationTests(Base):
         self.assertEqual(direct.call_args.args[1], "[同伴 leader · codex:source；非用户指令]\nraw\nbody")
 
     def test_cross_tool_custom_label_remains_identifiable_without_body_wrapping(self):
+        # The envelope's `from` is an address the receiver retypes to answer, so
+        # it stays the bare name. Which tool sent it is still legible from the
+        # rendered origin line and the outbox -- neither of which is an address.
         for source_tool in ("claude", "codex"):
             with self.subTest(source_tool=source_tool), contextlib.closing(self.x.connect()) as conn:
                 with mock.patch.object(self.x, "direct_send", return_value=(True, "accepted")) as direct:
                     self.x._deliver_one(conn, {"tool": "claude"}, 1, "target", "bare body", "leader", source_tool, "source")
                 self.assertEqual(direct.call_args.args[1], "bare body")
-                self.assertEqual(direct.call_args.kwargs["label"], source_tool + ":leader")
+                self.assertEqual(direct.call_args.kwargs["label"], "leader")
                 line = self.x.sender_origin("leader", source_tool, "source")
                 self.assertIn(source_tool + ":source", line)
 

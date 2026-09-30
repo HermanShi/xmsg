@@ -433,8 +433,18 @@ hook 和可见 user-input 兼容通道统一只添加一行必要来源：
 
 没有额外计数头、消息 ID、时间戳、XML 信封或回复指南；这些诊断仍留在 `outbox`。
 来源声明不是认证，自定义 label 不能取代 `claude` / `codex` 工具名；未知来源也不会冒充用户。
-Claude UDS 只保留 host 要求的最小 `<cross-session-message>` 权限信封，原生 sender label
-包含工具名（例如 `codex:leader`），其 body 不叠加 xmsg 包装。
+Claude UDS 只保留 host 要求的最小 `<cross-session-message>` 权限信封，其 body 不叠加 xmsg 包装。
+
+信封里的 `from` 是**接收方照抄回去就能回信的地址**，所以它只放发送方的会话名（`leader`），
+不拼工具名 —— `claude:leader` / `claude:1515212e` 这类复合串 `resolve_target` 三条规则
+（完整 id / 精确会话名 / id 前缀）一条都匹配不上，接收方想回信会找不到人。发送方是哪个工具
+由 `from-session` 和 `outbox` 提供，那两处都不需要接收方重新输入。
+
+label 未显式指定时按此顺序取：`XMSG_FROM` → 本机索引里的会话名（Claude 读
+`custom-title.json`，Codex 读 `session_index.jsonl` 的最后一次改名）→ 会话 id 前 8 位。
+三者都是 `xmsg send` 能解析的地址。会话名含非 ASCII 字符（`审查-会话`）时，host 的
+`from` 字符类不接受，信封改放 id 前缀而不是丢掉整个 `from`（丢了接收方就没有地址可回），
+完整名字仍留在 `outbox`。
 
 ## 投递语义：at-most-once，不做已读确认
 
@@ -563,7 +573,7 @@ label 伪造不了 session）、清理 9 例（保留窗口内外、只收不发
 | `XMSG_RETAIN_PEER_SECONDS` | 2592000 | peers 记录保留多久（30 天） |
 | `XMSG_HOOK_SWEEP_INTERVAL` | 3600 | hook 路径最短清理间隔（秒） |
 | `XMSG_VACUUM_FREE_PAGES` | 256 | freelist 超过多少页才 VACUUM 收缩文件 |
-| `XMSG_FROM` | — | 发送方 label（只是显示名，伪造不了署名） |
+| `XMSG_FROM` | 本机索引里的会话名，没有则 id 前 8 位 | 发送方 label，也是接收方回信要照抄的地址（只是地址，伪造不了署名） |
 | `XMSG_FROM_TOOL` / `XMSG_FROM_SESSION` | — | 显式来源；默认识别 `CODEX_SESSION_ID` / `CODEX_THREAD_ID` 或 `CLAUDE_CODE_SESSION_ID`；均缺失则 `unattributed` |
 | `XMSG_NO_FAILOPEN` | — | `=1` 关掉全部兜底，仅用于反证 |
 | `XMSG_REMOTE` | `peer`（若在 PATH） | 在另一台机器上执行一条命令。xmsg **不附带** SSH 助手；这是操作者自己的包装（`ssh otherhost`、ControlMaster 封装，等等）。`peer:` 前缀和 `xmsg list --peer` 走这条 |
