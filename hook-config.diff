@@ -152,3 +152,38 @@ Claude 侧两个条目，对应两个投递窗口（缺一个不会坏，只是�
 
 5. Claude 侧这条已在独立 settings 文件里实测通过（--settings 隔离），
    Codex 侧已在独立 CODEX_HOME 里实测通过。两边都不是推演。
+
+
+Antigravity（agy）侧
+--------------------
+
+配置在 ~/.gemini/config/hooks.json，顶层是「命名条目 → 事件 → hook 数组」。
+纯新增一个 "xmsg" 条目即可，不动已有的（如 agentforge-handoff）：
+
+  "xmsg": {
+    "PreInvocation": [
+      { "type": "command", "command": "<路径>/xmsg-hook.sh agy PreInvocation", "timeout": 5 }
+    ],
+    "Stop": [
+      { "type": "command", "command": "<路径>/xmsg-hook.sh agy Stop", "timeout": 5 }
+    ]
+  }
+
+与 Claude/Codex 的三点差异：
+
+1. **事件名必须走命令行参数**。agy 的 payload 不带 hook_event_name
+   （共享字段只有 conversationId / workspacePaths / transcriptPath /
+   artifactDirectoryPath），所以 PreInvocation 与 Stop 两条命令不同。
+   漏传时 xmsg 静默不认领消息（留在队列），不会以错误形态浪费投递。
+
+2. 输出契约不同：PreInvocation 读 {"injectSteps":[{"ephemeralMessage":...}]}；
+   Stop 读 {"decision":"continue","reason":...}（Claude/Codex 是 "block"）。
+   continue 会阻止 agy 转入 idle 并以 reason 作为新输入重启下一轮。
+
+3. 没有直投通道：发到 agy 的消息一律 queued，等下一次 PreInvocation
+   （会话运行中）或 Stop（正要 idle）投递。防死循环不靠 payload 字段
+   （agy 没有 stop_hook_active），靠 at-most-once 认领：重启后那一轮
+   自己的 Stop 找不到消息，返回空，正常停止。
+
+2026-10-02 实测通过：挂载后运行中的 agy 会话每轮自动注册 peer
+（xmsg list 出现 TOOL=agy），send → PreInvocation 注入全链路走通。

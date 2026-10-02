@@ -66,6 +66,20 @@ PAYLOAD = {
     "tool_use_id": "exec-7eeb03e4",
 }
 
+# Antigravity (agy) native shape: camelCase fields, no event name, no model,
+# no permission mode. Field names per the 2026-07-30 four-tool schema survey
+# and the production lifecycle hook; Stop additionally carries
+# terminationReason/fullyIdle, which xmsg does not need.
+AGY_PAYLOAD = {
+    "conversationId": "b9126cf9-099b-46a0-95b4-4774a1eb52be",
+    "workspacePaths": ["/home/llm/agent-msg", "/home/llm"],
+    "transcriptPath": (
+        "/home/llm/.gemini/antigravity-cli/brain/"
+        "b9126cf9-099b-46a0-95b4-4774a1eb52be/.system_generated/logs/transcript.jsonl"
+    ),
+    "artifactDirectoryPath": "/tmp/agy-artifacts",
+}
+
 
 class Base(unittest.TestCase):
     def setUp(self) -> None:
@@ -78,6 +92,10 @@ class Base(unittest.TestCase):
         self.sockdir = self.tmp / "cc-socks"
         self.sockdir.mkdir()
         self.x.SOCK_DIRS = [self.sockdir]
+        # The arrival banner writes to the controlling terminal; redirect it
+        # into tmp so delivery tests never paint the real terminal of whoever
+        # is running the suite (and tests can assert on the bytes).
+        self.x.TTY_PATH = str(self.tmp / "tty-sink")
         self.x.CODEX_HOME = self.tmp / "codex"
         # Both name indexes are module constants resolved at import, so pointing
         # CODEX_HOME at tmp does not move them. local_session_name() reads them
@@ -85,6 +103,14 @@ class Base(unittest.TestCase):
         # machine's own session titles.
         self.x.CODEX_SESSION_INDEX = self.tmp / "codex" / "session_index.jsonl"
         self.x.CLAUDE_PROJECTS = self.tmp / "claude-projects"
+        # agy wake isolation. The agy fixtures use real conversation ids, so
+        # without this any module-level send to an agy peer finds the real
+        # ~/.local/bin/agy and actually resumes a real conversation: empty
+        # presence/proc dirs read as "never attached", and no binary degrades
+        # the wake to a plain queue. TestAgyWake puts the pieces back.
+        self.x.AGY_PRESENCE_DIR = self.tmp / "agy-presence"
+        self.x.PROC_ROOT = self.tmp / "agy-proc"
+        self.x.agy_bin = lambda: ""
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -633,6 +659,516 @@ class TestStopWindow(Base):
             conn.close()
         self.assertEqual(row["delivered_event"], "Stop")
         self.assertEqual(row["delivered_tool"], "claude")
+
+
+class TestAntigravityHook(Base):
+    """Antigravity (agy) receive path: camelCase payload, event name via argv.
+
+    agy payloads carry no hook_event_name, so the hook config passes the event
+    as an argument (xmsg-hook.sh agy PreInvocation). Output contracts:
+    PreInvocation -> injectSteps/ephemeralMessage, Stop -> decision "continue".
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sid = AGY_PAYLOAD["conversationId"]
+
+    def agy(self, event: str = "PreInvocation", payload: dict | None = None) -> str:
+        return self.x.hook_body(
+            "agy",
+            json.dumps(payload if payload is not None else AGY_PAYLOAD),
+            event,
+        )
+
+    def peer_row(self):
+        conn = self.x.connect()
+        try:
+            return conn.execute(
+                "SELECT * FROM peers WHERE session_id = ?", (self.sid,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def test_preinvocation_injects_via_inject_steps(self) -> None:
+        self.queue("NONCE-AGY-0001 hello")
+        out = json.loads(self.agy())
+        steps = out["injectSteps"]
+        self.assertEqual(len(steps), 1)
+        self.assertIn("NONCE-AGY-0001", steps[0]["ephemeralMessage"])
+        self.assertNotIn("hookSpecificOutput", out)
+
+    def test_preinvocation_with_nothing_queued_outputs_nothing(self) -> None:
+        self.assertEqual(self.agy(), "")
+
+    def test_injected_text_keeps_peer_framing(self) -> None:
+        """The receiver must be able to tell a peer message from user input,
+        whatever the host's injection wrapper is called."""
+        self.queue("do the thing")
+        out = json.loads(self.agy())
+        self.assertTrue(
+            out["injectSteps"][0]["ephemeralMessage"].startswith(
+                "[同伴 peer-a · claude:sess-a；非用户指令]\n"
+            )
+        )
+
+    def test_stop_restarts_with_continue_decision(self) -> None:
+        """agy's Stop contract is decision "continue" (Claude/Codex use
+        "block" for the same restart-the-turn effect), reason becomes the
+        restarted turn's input."""
+        self.queue("NONCE-AGY-STOP-1")
+        out = json.loads(self.agy("Stop"))
+        self.assertEqual(out["decision"], "continue")
+        self.assertIn("NONCE-AGY-STOP-1", out["reason"])
+        self.assertNotIn("injectSteps", out)
+
+    def test_stop_with_nothing_queued_lets_the_session_go_idle(self) -> None:
+        self.assertEqual(self.agy("Stop"), "")
+
+    def test_restarted_turns_stop_does_not_loop(self) -> None:
+        """agy has no stop_hook_active field, so the anti-loop guarantee is the
+        at-most-once claim: after a Stop delivery restarts the session, that
+        turn's own Stop finds nothing and must stay silent."""
+        self.queue("NONCE-AGY-LOOP")
+        self.assertEqual(json.loads(self.agy("Stop"))["decision"], "continue")
+        self.assertEqual(self.agy("Stop"), "")
+
+    def test_preinvocation_and_stop_share_the_at_most_once_claim(self) -> None:
+        self.queue("NONCE-AGY-ONCE")
+        self.assertIn("NONCE-AGY-ONCE", self.agy())
+        self.assertEqual(
+            self.agy("Stop"), "", "Stop re-delivered an already claimed message"
+        )
+
+    def test_missing_event_argument_claims_nothing(self) -> None:
+        """A misconfigured hook (no event argument) must not claim: the output
+        would be in a shape agy cannot read, and a claimed-but-unreadable
+        message is a lost one. It stays queued for a correctly-wired event."""
+        self.queue("NONCE-AGY-NOEVENT")
+        self.assertEqual(self.x.hook_body("agy", json.dumps(AGY_PAYLOAD)), "")
+        out = json.loads(self.agy())
+        self.assertIn("NONCE-AGY-NOEVENT", out["injectSteps"][0]["ephemeralMessage"])
+
+    def test_conversation_id_registers_as_the_peer_session(self) -> None:
+        self.agy()
+        row = self.peer_row()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["tool"], "agy")
+        self.assertEqual(row["session_id"], self.sid)
+
+    def test_session_id_fallback_when_conversation_id_is_missing(self) -> None:
+        payload = {"session_id": "agy-legacy-1", "workspacePaths": ["/tmp/w"]}
+        self.queue("NONCE-AGY-FALLBACK", to="agy-legacy-1")
+        out = json.loads(self.agy(payload=payload))
+        self.assertIn(
+            "NONCE-AGY-FALLBACK", out["injectSteps"][0]["ephemeralMessage"]
+        )
+
+    def test_first_workspace_path_becomes_the_peer_cwd(self) -> None:
+        self.agy()
+        self.assertEqual(
+            self.peer_row()["cwd"], AGY_PAYLOAD["workspacePaths"][0]
+        )
+
+    def test_no_host_coordinates_are_recorded(self) -> None:
+        """agy has no direct-delivery channel; even when this test process runs
+        inside a Claude terminal, the outer host's pid/socket must not be
+        mis-attributed to the agy peer row."""
+        self.agy()
+        row = self.peer_row()
+        self.assertIsNone(row["pid"])
+        self.assertEqual(row["sock_path"], "")
+
+    def test_delivered_row_records_event_and_tool(self) -> None:
+        mid = self.queue("x")
+        self.agy()
+        conn = self.x.connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM messages WHERE id = ?", (mid,)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["delivered_event"], "PreInvocation")
+        self.assertEqual(row["delivered_tool"], "agy")
+
+
+class TestAgyWake(Base):
+    """The wake fallback for agy conversations nobody is attached to.
+
+    Liveness is an open presence-lock fd, not the lock file -- stale locks
+    persist forever, so a file-only check would treat every dead conversation
+    as busy and never wake one. A dead conversation gets resumed headlessly;
+    the wake carries no body, because the resumed process's PreInvocation hook
+    injects the queued rows through the normal at-most-once claim.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sid = AGY_PAYLOAD["conversationId"]
+        self.presence = self.tmp / "presence"
+        self.presence.mkdir()
+        self.x.AGY_PRESENCE_DIR = self.presence
+        self.proc = self.tmp / "proc"
+        self.proc.mkdir()
+        self.x.PROC_ROOT = self.proc
+        self.spawned: list[list[str]] = []
+        patcher = mock.patch.object(
+            self.x.subprocess, "Popen", side_effect=self._fake_popen
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # Base neutralized agy_bin so stray sends can never wake a real
+        # conversation; this class is about the wake, so hand it a fake binary.
+        self.fake_agy = self.tmp / "fake-agy"
+        self.fake_agy.write_text("#!/bin/sh\n")
+        self.x.agy_bin = lambda: str(self.fake_agy)
+
+    def _fake_popen(self, cmd, **kwargs):
+        self.spawned.append(list(cmd))
+        return mock.Mock()
+
+    def lock(self, conversation_id: str | None = None) -> Path:
+        """A presence lock with no holder: attached once, nobody home now."""
+        lock = self.presence / f"{conversation_id or self.sid}.lock"
+        lock.write_text("")
+        return lock
+
+    def make_live(self, conversation_id: str | None = None) -> None:
+        """Same lock, but a running process holds it open -- the live signal."""
+        lock = self.lock(conversation_id)
+        fd = self.proc / "424242" / "fd"
+        fd.mkdir(parents=True, exist_ok=True)
+        os.symlink(str(lock), str(fd / "7"))
+
+    def register_agy_peer(self) -> None:
+        self.x.hook_body("agy", json.dumps(AGY_PAYLOAD), "PreInvocation")
+
+    def deliver(self, body: str, mid: int) -> tuple[bool, str]:
+        conn = self.x.connect()
+        try:
+            out = self.x.direct_deliver(
+                conn, [mid], [self.sid], body, "peer-a", "claude", "sess-a"
+            )
+        finally:
+            conn.close()
+        return out[mid]
+
+    def queued_state(self, mid: int) -> tuple:
+        conn = self.x.connect()
+        try:
+            row = conn.execute(
+                "SELECT delivered_at, delivered_event FROM messages WHERE id = ?",
+                (mid,),
+            ).fetchone()
+            return (row["delivered_at"], row["delivered_event"])
+        finally:
+            conn.close()
+
+    def test_stale_lock_alone_is_not_live(self) -> None:
+        self.lock()
+        self.assertFalse(self.x.agy_conversation_live(self.sid))
+
+    def test_open_lock_fd_is_live(self) -> None:
+        self.make_live()
+        self.assertTrue(self.x.agy_conversation_live(self.sid))
+
+    def test_conversation_never_attached_is_not_live(self) -> None:
+        self.assertFalse(self.x.agy_conversation_live("no-such-conversation"))
+
+    def test_dead_conversation_send_dispatches_a_wake(self) -> None:
+        self.register_agy_peer()
+        self.lock()
+        mid = self.queue("NONCE-AGY-WAKE-1")
+        ok, detail = self.deliver("NONCE-AGY-WAKE-1", mid)
+        self.assertFalse(ok, "a wake is a kick, not a delivery")
+        self.assertIn("wake dispatched", detail)
+        self.assertEqual(len(self.spawned), 1)
+        cmd = self.spawned[0]
+        self.assertEqual(cmd[0], str(self.fake_agy))
+        self.assertEqual(cmd[cmd.index("--conversation") + 1], self.sid)
+        self.assertIn("-p", cmd)
+        # The bare-number trap that made the channel look broken: agy parses
+        # --print-timeout as a Go duration and rejects "600" without a unit.
+        self.assertRegex(cmd[cmd.index("--print-timeout") + 1], r"^\d+[smh]$")
+        self.assertEqual(
+            self.queued_state(mid), (None, None),
+            "the wake must not mark the row delivered; the claim is the hook's job",
+        )
+
+    def test_live_conversation_is_left_to_its_own_hooks(self) -> None:
+        """Resuming an attached conversation would fight the running process
+        over its presence lock; a live session's hooks already have windows."""
+        self.register_agy_peer()
+        self.make_live()
+        mid = self.queue("NONCE-AGY-WAKE-2")
+        ok, detail = self.deliver("NONCE-AGY-WAKE-2", mid)
+        self.assertFalse(ok)
+        self.assertIn("hook-only", detail)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.queued_state(mid), (None, None))
+
+    def test_cooldown_prevents_a_wake_storm(self) -> None:
+        """Burst sends must not spawn a pile of resume processes racing for the
+        same lock; one kick per cooldown window is enough for all queued rows."""
+        self.register_agy_peer()
+        self.lock()
+        mid1 = self.queue("NONCE-AGY-WAKE-3")
+        self.deliver("NONCE-AGY-WAKE-3", mid1)
+        mid2 = self.queue("NONCE-AGY-WAKE-4")
+        ok, detail = self.deliver("NONCE-AGY-WAKE-4", mid2)
+        self.assertFalse(ok)
+        self.assertIn("cooldown", detail)
+        self.assertEqual(len(self.spawned), 1)
+        self.assertEqual(self.queued_state(mid2), (None, None))
+
+    def test_missing_binary_reports_hook_only_and_queues(self) -> None:
+        self.register_agy_peer()
+        self.lock()
+        with mock.patch.object(self.x, "agy_bin", return_value=""):
+            mid = self.queue("NONCE-AGY-WAKE-5")
+            ok, detail = self.deliver("NONCE-AGY-WAKE-5", mid)
+        self.assertFalse(ok)
+        self.assertIn("no agy binary", detail)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.queued_state(mid), (None, None))
+
+    def test_spawn_failure_is_not_fatal_and_keeps_the_row(self) -> None:
+        self.register_agy_peer()
+        self.lock()
+        with mock.patch.object(
+            self.x.subprocess, "Popen", side_effect=OSError("boom")
+        ):
+            mid = self.queue("NONCE-AGY-WAKE-6")
+            ok, detail = self.deliver("NONCE-AGY-WAKE-6", mid)
+        self.assertFalse(ok)
+        self.assertIn("wake failed", detail)
+        self.assertEqual(self.queued_state(mid), (None, None))
+
+
+class TestNameAndLabel(Base):
+    """`xmsg name`: the naming path for hosts without a name index.
+
+    agy has no custom-title/thread-name file, so the peer row's label is the
+    only persistent session name it can have. These cover both directions the
+    name has to work: addressing the session (`xmsg send <name>`) and the
+    sender signing with it automatically so receivers can reply by name.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agy_sid = AGY_PAYLOAD["conversationId"]
+
+    def agy_hook(self, event: str = "PreInvocation") -> str:
+        return self.x.hook_body("agy", json.dumps(AGY_PAYLOAD), event)
+
+    def peer_label(self) -> str:
+        conn = self.x.connect()
+        try:
+            row = conn.execute(
+                "SELECT label FROM peers WHERE session_id = ?", (self.agy_sid,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return str(row["label"]) if row is not None else None
+
+    def test_named_session_is_addressable_by_name(self) -> None:
+        self.agy_hook()
+        self.x.main(["name", self.agy_sid, "agy-main"])
+        conn = self.x.connect()
+        try:
+            resolved = self.x.resolve_target(conn, "agy-main", allow_unknown=False)
+        finally:
+            conn.close()
+        self.assertEqual(resolved, [self.agy_sid])
+
+    def test_name_survives_subsequent_hook_registration(self) -> None:
+        """Hook registration deliberately never touches the label column, so
+        the name must outlive every following turn's re-registration."""
+        self.agy_hook()
+        self.x.main(["name", self.agy_sid, "agy-main"])
+        self.agy_hook()
+        self.agy_hook("Stop")
+        self.assertEqual(self.peer_label(), "agy-main")
+
+    def test_send_by_name_delivers_to_the_named_session(self) -> None:
+        self.agy_hook()
+        self.x.main(["name", self.agy_sid, "agy-main"])
+        self.x.main(["send", "agy-main", "NONCE-NAME-1 by name"])
+        out = json.loads(self.agy_hook())
+        self.assertIn("NONCE-NAME-1", out["injectSteps"][0]["ephemeralMessage"])
+
+    def test_discovery_exposes_the_name(self) -> None:
+        self.agy_hook()
+        self.x.main(["name", self.agy_sid, "agy-main"])
+        conn = self.x.connect()
+        try:
+            names = self.x._queue_name_map(conn)
+        finally:
+            conn.close()
+        self.assertEqual(names.get(self.agy_sid), "agy-main")
+
+    def test_empty_label_clears_the_name(self) -> None:
+        self.agy_hook()
+        self.x.main(["name", self.agy_sid, "agy-main"])
+        self.x.main(["name", "agy-main", ""])
+        self.assertEqual(self.peer_label(), "")
+
+    def test_naming_an_unregistered_session_is_refused(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.x.main(["name", "no-such-session", "whatever"])
+
+    def test_whitespace_label_is_refused(self) -> None:
+        self.agy_hook()
+        with self.assertRaises(SystemExit):
+            self.x.main(["name", self.agy_sid, "two words"])
+
+    def test_sender_signs_with_its_peer_label(self) -> None:
+        """agy 侧的「发送名称」：没有 XMSG_FROM、host 也没有名字索引时，发送方
+        自动用 `xmsg name` 设置的名字署名 —— 接收方按名字回信即可解析。"""
+        self.agy_hook()
+        self.x.main(["name", self.agy_sid, "agy-main"])
+        with mock.patch.dict(
+            os.environ,
+            {"XMSG_FROM_TOOL": "agy", "XMSG_FROM_SESSION": self.agy_sid},
+        ):
+            label, tool, session = self.x.default_sender_label()
+        self.assertEqual(label, "agy-main")
+        self.assertEqual(tool, "agy")
+        self.assertEqual(session, self.agy_sid)
+
+    def test_explicit_xmsg_from_still_wins_over_peer_label(self) -> None:
+        self.agy_hook()
+        self.x.main(["name", self.agy_sid, "agy-main"])
+        with mock.patch.dict(
+            os.environ,
+            {
+                "XMSG_FROM": "per-message-override",
+                "XMSG_FROM_TOOL": "agy",
+                "XMSG_FROM_SESSION": self.agy_sid,
+            },
+        ):
+            label, _, _ = self.x.default_sender_label()
+        self.assertEqual(label, "per-message-override")
+
+
+class TestTtyNotification(Base):
+    """_notify_tty: opt-in single-line banner - CRLF, sanitized, non-blocking.
+
+    The banner is OFF by default: under a host TUI our /dev/tty bytes land at
+    the host's cursor (its input box) and garble on repaint - a real agy user
+    reported exactly that, which no byte-level test can see. When enabled
+    (XMSG_TTY_BANNER=1) it is written *after* the rows are claimed, so it must
+    never hang (a flow-controlled terminal would let the wrapper timeout kill
+    the hook and lose the injection) and never echo peer-supplied escape
+    sequences onto the user's terminal. Base redirects TTY_PATH into tmp.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The shape tests exercise the enabled banner; the opt-in gate itself
+        # has its own test below.
+        patcher = mock.patch.dict(os.environ, {"XMSG_TTY_BANNER": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def row(self, label: str = "peer-a", body: str = "hello") -> dict:
+        return {"from_label": label, "from_tool": "claude", "from_session": "s1", "body": body}
+
+    def banner(self) -> str:
+        # read_bytes, NOT read_text: text mode's universal-newline translation
+        # would silently rewrite the very \r\n this class is asserting on.
+        p = Path(self.x.TTY_PATH)
+        return p.read_bytes().decode("utf-8", errors="replace") if p.exists() else ""
+
+    def test_banner_is_one_line_wrapped_in_crlf(self) -> None:
+        self.x._notify_tty([self.row()])
+        content = self.banner()
+        self.assertTrue(content.startswith("\r\n"))
+        self.assertTrue(content.endswith("\r\n"))
+        self.assertEqual(content.count("\n"), 2, "banner must stay a single line")
+        self.assertIn("1 条跨会话消息", content)
+        self.assertIn("peer-a", content)
+
+    def test_every_newline_is_preceded_by_cr(self) -> None:
+        """Raw-mode terminals: a bare \\n is the staircase effect."""
+        self.x._notify_tty([self.row(body="multi\nline body")])
+        content = self.banner()
+        for i, ch in enumerate(content):
+            if ch == "\n":
+                self.assertEqual(content[i - 1], "\r", f"bare \\n at offset {i}")
+
+    def test_banner_is_opt_in_and_silent_by_default(self) -> None:
+        """The regression the user saw: under a TUI the banner lands on the
+        host's input box. Without XMSG_TTY_BANNER=1 nothing may be written."""
+        env_without = {k: v for k, v in os.environ.items() if k != "XMSG_TTY_BANNER"}
+        with mock.patch.dict(os.environ, env_without, clear=True):
+            self.x._notify_tty([self.row()])
+        self.assertEqual(self.banner(), "")
+
+    def test_no_rows_no_banner(self) -> None:
+        self.x._notify_tty([])
+        self.assertEqual(self.banner(), "")
+
+    def test_peer_supplied_ansi_and_control_chars_are_stripped(self) -> None:
+        """from_label/body are attacker-controllable: echoing raw escapes
+        would let a sender paint the receiver's terminal."""
+        self.x._notify_tty(
+            [self.row(label="evil\x1b[31mRED\x1b[0m\x07", body="x\x1b[2Jy\x00z")]
+        )
+        content = self.banner()
+        # Only the banner's own two color codes may contain ESC.
+        self.assertEqual(content.count("\x1b"), 2)
+        self.assertIn("evilRED", content)
+        self.assertIn("xyz", content)
+
+    def test_banner_is_clipped_to_terminal_width(self) -> None:
+        with mock.patch(
+            "shutil.get_terminal_size", return_value=os.terminal_size((60, 24))
+        ):
+            self.x._notify_tty([self.row(label="来源很长" * 10, body="内容很长" * 100)])
+        plain = (
+            self.banner().replace("\x1b[1;36m", "").replace("\x1b[0m", "").strip("\r\n")
+        )
+        self.assertLessEqual(self.x._display_width(plain), 60)
+        self.assertTrue(plain.endswith("…"))
+
+    def test_display_width_counts_cjk_as_two_and_controls_as_zero(self) -> None:
+        self.assertEqual(self.x._display_width("ab中文"), 6)
+        # ESC itself counts 0, but the sequence *body* is visible text - which
+        # is exactly why echo paths must run _sanitize_for_tty, not just width.
+        self.assertEqual(self.x._display_width("\x1b"), 0)
+        self.assertEqual(self.x._display_width("\x1b[31m"), 4)
+        self.assertEqual(self.x._display_width(""), 0)
+
+    def test_many_senders_are_summarized_not_listed(self) -> None:
+        rows = [self.row(label=f"peer-{i}") for i in range(5)]
+        self.x._notify_tty(rows)
+        content = self.banner()
+        self.assertIn("5 条跨会话消息", content)
+        self.assertIn("等 5 方", content)
+        self.assertNotIn("peer-4", content)
+
+    def test_unreadable_terminal_does_not_hang_or_raise(self) -> None:
+        """O_NONBLOCK regression: opening a FIFO with no reader blocks forever
+        in blocking mode; non-blocking gets ENXIO immediately and skips. The
+        claimed rows must never depend on the terminal accepting a write."""
+        fifo = self.tmp / "dead-tty"
+        os.mkfifo(fifo)
+        self.x.TTY_PATH = str(fifo)
+        start = time.monotonic()
+        self.x._notify_tty([self.row()])
+        self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_missing_tty_is_a_quiet_noop(self) -> None:
+        self.x.TTY_PATH = str(self.tmp / "nonexistent" / "tty")
+        self.x._notify_tty([self.row()])  # must not raise
+
+    def test_hook_delivery_paints_the_redirected_tty(self) -> None:
+        """Integration: the claim path fires the banner (redirected into tmp),
+        so delivery notifies without touching the real terminal in tests."""
+        self.queue("NONCE-TTY-1")
+        self.hook()
+        self.assertIn("1 条跨会话消息", self.banner())
 
 
 class TestSweep(Base):
@@ -1374,6 +1910,37 @@ class TestCli(unittest.TestCase):
             env=self.env,
         )
 
+    def agy_hook_once(
+        self, event: str, conversation_id: str, workspace: str | None = None
+    ) -> subprocess.CompletedProcess:
+        """agy payloads carry no event name, so the CLI takes it as --event,
+        exactly the way xmsg-hook.sh forwards its second argument."""
+        payload = dict(AGY_PAYLOAD, conversationId=conversation_id)
+        if workspace is not None:
+            payload["workspacePaths"] = [workspace]
+        return subprocess.run(
+            [sys.executable, str(IMPL), "hook", "--tool", "agy", "--event", event],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+
+    def agy_live_env(self, conversation_id: str) -> None:
+        """Point the CLI at a fake presence/proc pair reporting: this agy
+        conversation is attached to a running process that holds its lock open,
+        so sends must stay on the hook-only path instead of waking a second one."""
+        presence = self.tmp / f"presence-{conversation_id}"
+        presence.mkdir(parents=True, exist_ok=True)
+        lock = presence / f"{conversation_id}.lock"
+        lock.write_text("")
+        proc = self.tmp / f"proc-{conversation_id}"
+        fd = proc / "999999" / "fd"
+        fd.mkdir(parents=True, exist_ok=True)
+        os.symlink(str(lock), str(fd / "7"))
+        self.env["XMSG_AGY_PRESENCE_DIR"] = str(presence)
+        self.env["XMSG_PROC_ROOT"] = str(proc)
+
     def test_send_then_hook_delivers_and_outbox_confirms(self) -> None:
         self.hook_once("sess-cli-1")
         send = self.cli("send", "sess-cli-1", "NONCE-CLI-9001 hi")
@@ -1417,6 +1984,102 @@ class TestCli(unittest.TestCase):
         row = next(r for r in rows if r["session_id"] == "sess-cli-6")
         self.assertEqual(row["queued"], 1)
         self.assertEqual(row["tool"], "codex")
+
+    def test_send_to_agy_session_waits_for_its_hook(self) -> None:
+        """A live agy has no direct channel: send must queue (not fail, not fake
+        a delivery, not wake a second process over the attached one) and the
+        next PreInvocation hook injects it."""
+        self.agy_hook_once("PreInvocation", "sess-agy-1")
+        self.agy_live_env("sess-agy-1")
+        send = self.cli("send", "sess-agy-1", "NONCE-CLI-AGY-1 hi")
+        self.assertEqual(send.returncode, 0, send.stderr)
+        self.assertIn("queued #1", send.stdout)
+        self.assertIn("hook-only", send.stdout)
+
+        hooked = self.agy_hook_once("PreInvocation", "sess-agy-1")
+        self.assertIn("NONCE-CLI-AGY-1", hooked.stdout)
+        self.assertIn("injectSteps", hooked.stdout)
+
+    def test_send_to_dead_agy_conversation_dispatches_a_wake(self) -> None:
+        """Real subprocesses end to end: a registered agy conversation nobody
+        holds the lock of will never run a hook again, so send resumes it
+        headlessly. The body does not ride along -- the row stays queued for
+        the woken process's own PreInvocation hook to claim."""
+        presence = self.tmp / "presence-dead"
+        presence.mkdir()
+        (presence / "sess-agy-wake.lock").write_text("")  # stale, no holder
+        proc = self.tmp / "proc-empty"
+        proc.mkdir()
+        wake_args = self.tmp / "wake-args.txt"
+        fake_agy = self.tmp / "bin" / "agy"
+        fake_agy.parent.mkdir()
+        fake_agy.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {wake_args}\n')
+        fake_agy.chmod(0o755)
+        self.env.update(
+            {
+                "XMSG_AGY_PRESENCE_DIR": str(presence),
+                "XMSG_PROC_ROOT": str(proc),
+                "XMSG_AGY_BIN": str(fake_agy),
+            }
+        )
+        self.agy_hook_once("PreInvocation", "sess-agy-wake", workspace=str(self.tmp))
+        send = self.cli("send", "sess-agy-wake", "NONCE-CLI-AGY-WAKE")
+        self.assertEqual(send.returncode, 0, send.stderr)
+        self.assertIn("queued #1", send.stdout)
+        self.assertIn("wake dispatched", send.stdout)
+
+        for _ in range(50):  # the wake is detached; wait for it to record its args
+            if wake_args.exists():
+                break
+            time.sleep(0.1)
+        args = wake_args.read_text().splitlines()
+        self.assertEqual(args[args.index("--conversation") + 1], "sess-agy-wake")
+        self.assertIn("-p", args)
+        self.assertRegex(args[args.index("--print-timeout") + 1], r"^\d+[smh]$")
+
+        outbox = self.cli("outbox")
+        self.assertIn("NONCE-CLI-AGY-WAKE", outbox.stdout)
+        self.assertIn("queued", outbox.stdout)
+
+        # ...and the woken process's hook injects the row, closing the loop.
+        hooked = self.agy_hook_once(
+            "PreInvocation", "sess-agy-wake", workspace=str(self.tmp)
+        )
+        self.assertIn("NONCE-CLI-AGY-WAKE", hooked.stdout)
+        self.assertIn("injectSteps", hooked.stdout)
+
+    def test_agy_stop_delivers_continue_decision(self) -> None:
+        self.agy_hook_once("PreInvocation", "sess-agy-2")
+        self.cli("send", "sess-agy-2", "NONCE-CLI-AGY-2")
+        out = json.loads(self.agy_hook_once("Stop", "sess-agy-2").stdout)
+        self.assertEqual(out["decision"], "continue")
+        self.assertIn("NONCE-CLI-AGY-2", out["reason"])
+
+    def test_hook_sh_forwards_the_event_argument(self) -> None:
+        """The real wrapper: agy's hook config relies on argv[2] reaching
+        --event; a dropped argument would silently fall back to the
+        PreToolUse-shaped output agy cannot read."""
+        self.agy_hook_once("PreInvocation", "sess-agy-3")
+        self.cli("send", "sess-agy-3", "NONCE-CLI-AGY-3")
+        proc = subprocess.run(
+            [str(HOOK_SH), "agy", "Stop"],
+            input=json.dumps(dict(AGY_PAYLOAD, conversationId="sess-agy-3")),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out["decision"], "continue")
+        self.assertIn("NONCE-CLI-AGY-3", out["reason"])
+
+    def test_list_shows_the_agy_session(self) -> None:
+        self.agy_hook_once("PreInvocation", "sess-agy-4")
+        rows = json.loads(self.cli("list", "--json").stdout)
+        row = next(r for r in rows if r["session_id"] == "sess-agy-4")
+        self.assertEqual(row["tool"], "agy")
+        self.assertFalse(row["direct"])
+        self.assertEqual(row["cwd"], AGY_PAYLOAD["workspacePaths"][0])
 
     def test_send_reads_the_body_from_stdin(self) -> None:
         self.hook_once("sess-cli-7")

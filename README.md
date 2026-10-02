@@ -2,7 +2,8 @@
 
 让一个 agent 会话给另一个会话发消息，优先显示在接收方会话中，不需要主动查信箱。
 
-支持 Claude Code 与 Codex CLI。
+支持 Claude Code、Codex CLI 与 Antigravity（agy）。agy 没有直投通道，靠 hook 注入；
+已离线的 agy 会话会被 headless resume 唤醒，让它的 hook 自己把消息取走。
 
 ```
 A 会话:  xmsg send <B的session> "..."      → 持久化、原子占位、尝试可见直投
@@ -12,6 +13,13 @@ B 还会再调工具:  PreToolUse hook 触发 → 取出消息 → additionalCon
 
 B 这一轮要收尾:  Stop hook 触发 → 取出消息 → decision:block + reason
                  → 这一轮带着消息重启，B 在转 idle 之前看到了内容
+
+B 是 agy 会话:   PreInvocation hook → injectSteps/ephemeralMessage（每轮推理前）
+                 Stop hook → decision:continue + reason（收尾时带消息重启）
+
+B 是离线 agy:    send 发现没人持有它的 presence lock → detached 执行
+                 `agy --conversation <id> -p <踢一脚> --print-timeout …` headless 唤醒
+                 → 被唤醒进程的 PreInvocation hook 照常认领队列里的消息
 ```
 
 接收方不问「有没有新消息」：可见直投使用 host 的消息入口；不可用时才由 hook 注入上下文。
@@ -28,6 +36,9 @@ B 这一轮要收尾:  Stop hook 触发 → 取出消息 → decision:block + re
 | `codex-queue` | 随时，包括对方 idle | 官方 `codex queue` 命令 | 渲染成用户输入，起一轮处理 |
 | `PreToolUse` | 一轮正在跑，即将调工具 | hook | 拼进那次工具调用前的上下文 |
 | `Stop` | 一轮正要收尾、转 idle | hook | 带着消息重启这一轮 |
+| `PreInvocation`（agy） | 每轮模型推理前 | hook（事件名走命令行参数） | `injectSteps[].ephemeralMessage` |
+| `Stop`（agy） | 一轮正要收尾、转 idle | hook | `decision:continue` + reason 重启这一轮 |
+| `agy-wake` | 离线 agy 会话，send 时 | detached `agy --conversation` headless resume | 唤醒轮自己的 PreInvocation hook 注入；消息本体不上命令行 |
 
 `xmsg send` 先写库，再原子占位，然后尝试直投。确定未送达才恢复 hook 队列。
 写入后超时、ACK 丢失或占位后进程崩溃会保留 `direct-uncertain` / `direct-inflight`，
@@ -257,6 +268,47 @@ clone 到 `~/agent-msg` 以外的路径也行，此时给两个 host 的 hook �
 `PreToolUse` 和 `Stop` 两个条目指向同一个 `xmsg-hook.sh`，事件名从 payload 里读，
 不靠参数区分。只加 `PreToolUse` 会缺少「对方正要 idle」时的 hook 降级窗口。
 
+Antigravity（agy）是事件名规则的**例外**：它的 payload 不带事件名，必须由 hook
+命令的参数传入，挂在 `~/.gemini/config/hooks.json`（纯新增条目，不动已有 hook）：
+
+```json
+"xmsg": {
+  "PreInvocation": [
+    { "type": "command", "command": "<路径>/xmsg-hook.sh agy PreInvocation", "timeout": 5 }
+  ],
+  "Stop": [
+    { "type": "command", "command": "<路径>/xmsg-hook.sh agy Stop", "timeout": 5 }
+  ]
+}
+```
+
+漏传事件参数时 hook 会静默不认领消息（消息留在队列等正确的事件），不会以 agy
+读不懂的输出形态浪费掉一次投递。agy 的 payload 字段是 camelCase
+（`conversationId` / `workspacePaths`），xmsg 内部自动归一化。没有直投通道，
+`send` 到 agy 一律 `queued`：运行中的会话由对方下一次 `PreInvocation` 或 `Stop`
+（`decision:continue` 带着消息重启该轮）投递；**离线会话**则在 send 时派生一个
+detached 的 `agy --conversation <id> -p <中性踢一脚> --print-timeout <dur>` 做
+headless resume（2026-10-02 PONG 实测打通）。消息本体**不上命令行**：被唤醒轮的
+PreInvocation hook 照常认领队列，所以唤醒失败或半路死掉都无损——消息仍在队列里
+等 TTL 或下一次唤醒。
+
+判活走 presence lock：`~/.gemini/antigravity-cli/presence/<conversationId>.lock`
+在会话attach 过一次后就会留下（过期锁永不清理，几个月前的也在），只有**运行中的
+进程持有该锁的 fd** 才算活。活会话绝不唤醒，避免和已 attach 的进程抢锁。agy 的
+language server 端口（HTTPS gRPC + HTTP）没有可用的消息路由，remote-control
+daemon 默认关闭，所以 resume 是唯一可靠的到达离线会话的通道。
+
+唤醒调节项（均有默认值，可不配）：`XMSG_AGY_BIN`（agy 二进制，默认 PATH →
+`~/.local/bin/agy`）、`XMSG_AGY_WAKE_TIMEOUT`（Go duration，默认 `600s`，
+裸数字会自动补 `s`——agy 对没单位的值直接报错落回 help）、`XMSG_AGY_WAKE_COOLDOWN`
+（同一会话冷却秒数，默认 120，防突发 send 派生一堆 resume 抢锁）、
+`XMSG_AGY_WAKE_ARGS`（追加参数，如 `--dangerously-skip-permissions`）、
+`XMSG_AGY_PRESENCE_DIR` / `XMSG_PROC_ROOT`（判活输入）。唤醒进程的输出追加在
+`~/.local/share/agent-msg/agy-wake.log`，事后可诊断"唤醒了但没认领"。
+
+agy 会话作为**发送方**时没有可自动识别的会话环境变量，需按通用约定导出
+`XMSG_FROM_TOOL=agy XMSG_FROM_SESSION=<conversationId>`（否则按 unattributed 处理）。
+
 ## 装在哪
 
 | 路径 | 作用 |
@@ -271,6 +323,7 @@ clone 到 `~/agent-msg` 以外的路径也行，此时给两个 host 的 hook �
 | `~/agent-msg/tests/test_visible_delivery.py` | 版本边界、可见消息来源、真实 TUI 探测和防重复投递回归测试 |
 | `~/agent-msg/tests/test_codex_history.py` | 选择、恢复防护、只读索引及 Unix WebSocket 协议测试 |
 | `~/.local/share/agent-msg/messages.sqlite3` | 消息队列（本机运行态，不进版本库） |
+| `~/.local/share/agent-msg/agy-wake.log` | agy 离线唤醒（headless resume）进程的输出日志（运行态） |
 
 消息库**故意不用** `~/.agent-memory/index.sqlite3`：那个库每分钟被 systemd timer
 mirror 一次、并且可从 Markdown 重建，而消息行两个性质都不具备，掺进去只会互相干扰。
@@ -307,11 +360,26 @@ xmsg send leader "按现有任务执行本轮巡检" --notification --from agent
 xmsg send peer:leaderpc "对面那台的会话"         # 在另一台机器上投递（要配 XMSG_REMOTE）
 xmsg list --peer                               # 列出对面机器上现在能收的会话
 
+xmsg name b9126cf9 agy             # 给会话命名，之后 `xmsg send agy` 直达（空名字清除）
 xmsg outbox                        # 我发的还有哪些没投出去
 xmsg outbox --all                  # 含已投递 / 已过期
 xmsg cancel 7                      # 撤回一条还没投出去的
 xmsg doctor                        # 配置与队列健康
 ```
+
+接收端 hook 投递消息时，可选地向该会话的控制终端打一行**单行横幅**
+（`📨 xmsg: 收到 N 条跨会话消息（来源: …）`），`XMSG_TTY_BANNER=1` 显式开启。
+**默认关闭**，这是真机反馈换来的结论：在宿主 TUI（claude/agy）里，hook 子进程写
+`/dev/tty` 的字节会落在终端**当前物理光标位置**——也就是宿主的输入框——且宿主
+对这些字节毫不知情，重绘时横幅错位、盖住输入框（2026-10-02 agy 真机实测：
+单行、CRLF、宽度截断都救不了，落点本身不受 hook 控制）。消息本体已经过
+`injectSteps`/`additionalContext` 注入并由宿主 UI 渲染给用户，横幅只是给非 TUI
+场景（headless 跑 agent、想要终端痕迹的操作者）的可选增强。
+开启时形态仍然保守：单行、`\r\n` 行尾（raw 模式下裸 `\n` 呈阶梯状）、按终端
+宽度截断（中文/全角按 2 列，`unicodedata.east_asian_width`）、来源与正文剥离
+ANSI 转义和控制字符（横幅文本是同伴可控输入，防终端注入）、**非阻塞写**——它在
+消息认领之后才打印，若在流控停住的终端上阻塞，wrapper 的 timeout 会连注入输出
+一起杀掉（消息标记已投递而模型没收到），因此写不进去就放弃，绝不等待。
 
 会话 id 从哪来：`xmsg list`。一个会话在**第一次工具调用**时自动注册成可投递目标，
 带上 cwd、model，以及直投需要的 pid / socket / 权限模式。没跑过任何工具调用的会话
@@ -321,6 +389,11 @@ xmsg doctor                        # 配置与队列健康
 解析顺序固定为：
 完整 session id → 精确自定义名 → id 前缀。自定义名有多个历史/活跃候选时会拒绝发送并列出
 完整 id，避免“leader”之类常见名称误投。
+
+自定义名除了来自 host 自己的索引（Claude `custom-title.json`、Codex `thread_name`），
+还可以用 `xmsg name <session> <label>` 写进 peer 行 —— 这是 agy 这类**没有名字索引的
+host 唯一的命名通道**。hook 每轮注册不会冲掉它；被命名的会话作为发送方时，若没有导出
+`XMSG_FROM`，会自动用这个名字署名，接收方按名字回信即可解析。
 
 定时器和本机脚本可显式使用 `send --notification`。它只声明「本机自动提醒」类型，
 只显示一行通知来源加正文，不是用户的新指令，也不会伪造 session 或权限。
@@ -666,7 +739,7 @@ OpenSSH 会把多余参数用空格拼成远程 shell 字符串，所以 xmsg �
 | Claude Code | `uds-direct` + `PreToolUse` + `Stop` | 三者均实测通过。直投走 host 的 unix socket，能触达 idle 会话 |
 | Codex CLI 0.151.0 | `codex queue` + `PreToolUse` + `Stop` | 三者均实测通过。直投走官方 `codex queue`（不是逆向的），同样能触达 idle 会话，见下。`Stop` 与 Claude 完全同构：payload 带 `stop_hook_active`/`last_assistant_message`，`decision:block` 被采纳（日志打 `hook: Stop Blocked`）。⚠️ 新增 hook 条目需一次交互式信任确认，见下 |
 | Cursor Agent | 无 | 只有 `sessionStart` 能注入；`beforeSubmitPrompt` 的 output 只支持 `continue`/`user_message`，官方文档明确不支持 context 注入。要接只能降级成开会话时投一次。 |
-| Antigravity / Gemini | 未知 | 本机没装，没有实测依据，故未实现。 |
+| Antigravity（agy） | `PreInvocation` + `Stop` + `agy-wake` | 实测通过（2026-10-02）。无直投 API：language server 端口无可用消息路由，remote-control daemon 默认关。运行中会话靠 hook 注入；离线会话由 send 派生 detached `agy --conversation` headless resume 唤醒，被唤醒轮的 PreInvocation 认领队列（PONG 往返 exit=0 实测）。`--print-timeout` 必须是 Go duration（`600s`），裸数字会报错落回 help |
 
 ### 旧独立 Codex host 的 queue 降级路径
 
